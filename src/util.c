@@ -68,3 +68,12 @@ obs_property_t *properties_add_hdr_scale(obs_properties_t *props)
 	obs_properties_add_bool(props, "hdr_labels", obs_module_text("HDR.Labels"));
 	return prop;
 }
+
+obs_property_t *properties_add_hdr_resolution(obs_properties_t *props, const char *name, const char *desc)
+{
+	obs_property_t *prop = obs_properties_add_list(props, name, desc, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(prop, obs_module_text("HDR.Resolution.256"), 256);
+	obs_property_list_add_int(prop, obs_module_text("HDR.Resolution.512"), 512);
+	obs_property_list_add_int(prop, obs_module_text("HDR.Resolution.1024"), 1024);
+	return prop;
+}

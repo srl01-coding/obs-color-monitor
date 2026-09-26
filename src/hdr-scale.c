@@ -122,6 +122,26 @@ static int text_width(const char *text, uint32_t s)
 	return (int)(strlen(text) * GLYPH_ADVANCE * s) - (int)s;
 }
 
+// Pixel position of the centre of a 10-bit code on an axis of `levels` pixels
+static inline float code_to_px(float code, uint32_t levels)
+{
+	return hdr_scale_code_to_px(code, levels);
+}
+
+struct placed
+{
+	int lo, hi;
+};
+
+static bool overlaps(const struct placed *p, int n, int lo, int hi)
+{
+	for (int i = 0; i < n; i++) {
+		if (lo <= p[i].hi + 1 && hi >= p[i].lo - 1)
+			return true;
+	}
+	return false;
+}
+
 uint8_t *hdr_scale_label_image_vertical(const struct hdr_scale_mark *marks, int n, uint32_t levels,
 					uint32_t glyph_scale, uint32_t *width)
 {
@@ -135,13 +155,26 @@ uint8_t *hdr_scale_label_image_vertical(const struct hdr_scale_mark *marks, int 
 	uint8_t *img = bzalloc((size_t)w * levels * 4);
 
 	const int th = GLYPH_H * (int)glyph_scale;
-	for (int i = 0; i < n; i++) {
-		const int line_y = (int)levels - 1 - (int)(marks[i].code + 0.5f);
-		int y0 = line_y - LABEL_MARGIN - th; // above the line
-		if (y0 < 0)
-			y0 = line_y + LABEL_MARGIN + 1; // no room: below the line
-		put_text(img, w, levels, LABEL_MARGIN, y0, marks[i].label, glyph_scale,
-			 marks[i].ref ? color_ref : color_normal);
+	struct placed placed[HDR_SCALE_MAX_MARKS];
+	int n_placed = 0;
+
+	// Reference labels first; other labels are dropped if they would collide.
+	for (int pass = 0; pass < 2; pass++) {
+		for (int i = 0; i < n; i++) {
+			if (marks[i].ref != (pass == 0))
+				continue;
+			const int line_y = (int)((float)levels - code_to_px(marks[i].code, levels));
+			int y0 = line_y - 1 - th; // above the line
+			if (y0 < 0)
+				y0 = line_y + 2; // no room: below the line
+			if (overlaps(placed, n_placed, y0, y0 + th - 1))
+				continue;
+			placed[n_placed].lo = y0;
+			placed[n_placed].hi = y0 + th - 1;
+			n_placed++;
+			put_text(img, w, levels, LABEL_MARGIN, y0, marks[i].label, glyph_scale,
+				 marks[i].ref ? color_ref : color_normal);
+		}
 	}
 
 	*width = w;
@@ -154,15 +187,27 @@ uint8_t *hdr_scale_label_image_horizontal(const struct hdr_scale_mark *marks, in
 	const uint32_t h = GLYPH_H * glyph_scale + LABEL_MARGIN * 2;
 	uint8_t *img = bzalloc((size_t)levels * h * 4);
 
-	for (int i = 0; i < n; i++) {
-		const int tw = text_width(marks[i].label, glyph_scale);
-		int x0 = (int)(marks[i].code + 0.5f) - tw / 2;
-		if (x0 < LABEL_MARGIN)
-			x0 = LABEL_MARGIN;
-		if (x0 + tw > (int)levels - LABEL_MARGIN)
-			x0 = (int)levels - LABEL_MARGIN - tw;
-		put_text(img, levels, h, x0, LABEL_MARGIN, marks[i].label, glyph_scale,
-			 marks[i].ref ? color_ref : color_normal);
+	struct placed placed[HDR_SCALE_MAX_MARKS];
+	int n_placed = 0;
+
+	for (int pass = 0; pass < 2; pass++) {
+		for (int i = 0; i < n; i++) {
+			if (marks[i].ref != (pass == 0))
+				continue;
+			const int tw = text_width(marks[i].label, glyph_scale);
+			int x0 = (int)code_to_px(marks[i].code, levels) - tw / 2;
+			if (x0 < 1)
+				x0 = 1;
+			if (x0 + tw > (int)levels - 1)
+				x0 = (int)levels - 1 - tw;
+			if (overlaps(placed, n_placed, x0, x0 + tw - 1))
+				continue;
+			placed[n_placed].lo = x0;
+			placed[n_placed].hi = x0 + tw - 1;
+			n_placed++;
+			put_text(img, levels, h, x0, LABEL_MARGIN, marks[i].label, glyph_scale,
+				 marks[i].ref ? color_ref : color_normal);
+		}
 	}
 
 	*height = h;

@@ -44,8 +44,10 @@ ROI sources (`roi.c`) share `cm.texrender`, so they inherit whatever common.c do
   Params: `obs_get_video_sdr_white_level()/10000`, `obs_get_video_hdr_nominal_peak_level()`,
   narrow/full range from `ovi.range`.
 - `cm_surface_data.hlg/full_range/levels`; `cm_unpack_r10g10b10a2()` in common.h.
-- waveform/histogram: 1024 bins in HLG, properties `hdr_scale` (HLG % / 10-bit code)
-  and `hdr_labels`; graticule marks + 5x7 bitmap labels in `src/hdr-scale.c`.
+- waveform/histogram: analysis is 10-bit; display resolution is a property
+  (`hdr_rows` / `hdr_cols`: 256 default = same source size as SDR, 4 codes per step;
+  512; 1024). Properties `hdr_scale` (HLG % / 10-bit code) and `hdr_labels`;
+  graticule marks + 5x7 bitmap labels (collision-avoiding) in `src/hdr-scale.c`.
   Cyan = reference lines (0%, 75% BT.2408 ref white, 100%; or 64/940).
 - vectorscope: decodes 10-bit (>>2) so it doesn't show garbage; graticule still 601/709.
 - Known gaps: PQ canvas uses legacy SDR path; zebra/false colour/focus peaking

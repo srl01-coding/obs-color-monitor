@@ -39,7 +39,7 @@ struct wvs_source
 	uint32_t tex_wv_levels;
 	uint8_t *tex_buf[2];
 	uint32_t tex_buf_width[2];
-	uint32_t tex_buf_levels[2]; // 256 (8-bit SDR) or 1024 (10-bit HLG)
+	uint32_t tex_buf_levels[2]; // display rows: 256 (SDR), hdr_rows (HLG)
 	bool tex_buf_hlg[2];
 	bool tex_buf_full_range[2];
 	volatile int w_tex_buf;
@@ -56,6 +56,7 @@ struct wvs_source
 	int graticule_lines;
 	int hdr_scale;
 	bool hdr_labels;
+	uint32_t hdr_rows; // HLG: 256, 512 or 1024 rows; 10-bit codes are binned 4, 2 or 1 per row
 	uint32_t graticule_key_prev;
 };
 
@@ -132,6 +133,7 @@ static void wvs_update(void *data, obs_data_t *settings)
 	src->graticule_lines = (int)obs_data_get_int(settings, "graticule_lines");
 	src->hdr_scale = (int)obs_data_get_int(settings, "hdr_scale");
 	src->hdr_labels = obs_data_get_bool(settings, "hdr_labels");
+	src->hdr_rows = hdr_rows_sanitize((int)obs_data_get_int(settings, "hdr_rows"));
 }
 
 static void wvs_get_defaults(obs_data_t *settings)
@@ -142,6 +144,7 @@ static void wvs_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "graticule_lines", 5);
 	obs_data_set_default_int(settings, "hdr_scale", HDR_SCALE_HLG_PERCENT);
 	obs_data_set_default_bool(settings, "hdr_labels", true);
+	obs_data_set_default_int(settings, "hdr_rows", 256);
 }
 
 static bool components_changed(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
@@ -195,6 +198,7 @@ static obs_properties_t *wvs_get_properties(void *data)
 	obs_property_list_add_int(prop, obs_module_text("Graticule.Step.10"), 10);
 
 	properties_add_hdr_scale(props);
+	properties_add_hdr_resolution(props, "hdr_rows", obs_module_text("HDR.Resolution.Waveform"));
 
 	return props;
 }
@@ -249,11 +253,13 @@ static inline void ensure_tex_buf_size(struct wvs_source *src, const uint32_t wi
 }
 
 static inline void wvs_draw_waveform_10bit(struct wvs_source *src, uint8_t *dbuf,
-					   const struct cm_surface_data *surface_data, const uint8_t *video_data)
+					   const struct cm_surface_data *surface_data, const uint8_t *video_data,
+					   const uint32_t rows)
 {
 	const uint32_t height = surface_data->height;
 	const uint32_t width = surface_data->width;
-	const uint32_t top = surface_data->levels - 1;
+	const uint32_t top = rows - 1;
+	const uint32_t shift = hdr_rows_shift(rows); // 10-bit code -> row
 
 	const bool calc_b = (src->components & 0x11) ? true : false;
 	const bool calc_g = (src->components & 0x22) ? true : false;
@@ -267,21 +273,22 @@ static inline void wvs_draw_waveform_10bit(struct wvs_source *src, uint8_t *dbuf
 			if (!a)
 				continue;
 			if (calc_b)
-				inc_uint8(dbuf + x * 4 + (top - b) * width * 4 + 0);
+				inc_uint8(dbuf + x * 4 + (top - (b >> shift)) * width * 4 + 0);
 			if (calc_g)
-				inc_uint8(dbuf + x * 4 + (top - g) * width * 4 + 1);
+				inc_uint8(dbuf + x * 4 + (top - (g >> shift)) * width * 4 + 1);
 			if (calc_r)
-				inc_uint8(dbuf + x * 4 + (top - r) * width * 4 + 2);
+				inc_uint8(dbuf + x * 4 + (top - (r >> shift)) * width * 4 + 2);
 		}
 	}
 }
 
-static inline void wvs_draw_waveform(struct wvs_source *src, uint8_t *dbuf, const struct cm_surface_data *surface_data)
+static inline void wvs_draw_waveform(struct wvs_source *src, uint8_t *dbuf, const struct cm_surface_data *surface_data,
+				     const uint32_t rows)
 {
 	const uint32_t height = surface_data->height;
 	const uint32_t width = surface_data->width;
 
-	for (uint32_t i = 0; i < width * surface_data->levels * 4; i++)
+	for (uint32_t i = 0; i < width * rows * 4; i++)
 		dbuf[i] = 0;
 
 	const uint8_t *video_data = NULL;
@@ -293,7 +300,7 @@ static inline void wvs_draw_waveform(struct wvs_source *src, uint8_t *dbuf, cons
 		return;
 
 	if (surface_data->hlg) {
-		wvs_draw_waveform_10bit(src, dbuf, surface_data, video_data);
+		wvs_draw_waveform_10bit(src, dbuf, surface_data, video_data, rows);
 		return;
 	}
 
@@ -345,11 +352,11 @@ static void wvs_surface_cb(void *data, struct cm_surface_data *surface_data)
 	if (!surface_data->width)
 		return;
 
-	const uint32_t levels = surface_data->levels ? surface_data->levels : WV_SIZE;
+	const uint32_t levels = surface_data->hlg ? src->hdr_rows : WV_SIZE;
 	ensure_tex_buf_size(src, surface_data->width, levels, src->w_tex_buf);
 
 	PROFILE_START(prof_draw_waveform_name);
-	wvs_draw_waveform(src, src->tex_buf[src->w_tex_buf], surface_data);
+	wvs_draw_waveform(src, src->tex_buf[src->w_tex_buf], surface_data, levels);
 	PROFILE_END(prof_draw_waveform_name);
 	src->tex_buf_hlg[src->w_tex_buf] = surface_data->hlg;
 	src->tex_buf_full_range[src->w_tex_buf] = surface_data->full_range;
@@ -374,7 +381,7 @@ static void create_graticule_hlg(struct wvs_source *src)
 		for (int i = 0; i < n; i++) {
 			if (marks[i].ref != ref)
 				continue;
-			const float y = (float)(levels - 1) - marks[i].code + 0.5f;
+			const float y = (float)levels - hdr_scale_code_to_px(marks[i].code, levels);
 			gs_vertex2f(0.0f, y);
 			gs_vertex2f(1.0f, y);
 		}

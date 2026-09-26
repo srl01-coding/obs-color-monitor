@@ -30,7 +30,26 @@ static inline float hdr_scale_signal_to_code(float e, bool full_range)
 	return full_range ? e * 1023.0f : 64.0f + 876.0f * e;
 }
 
+// Position of the centre of a 10-bit code's bin on an axis of `levels` pixels (bins of 1024/levels codes)
+static inline float hdr_scale_code_to_px(float code, uint32_t levels)
+{
+	return ((float)((uint32_t)code * levels / 1024) + 0.5f);
+}
+
+// Display resolution of HLG scopes: 256 (4 codes per row, same size as SDR), 512 or 1024
+static inline uint32_t hdr_rows_sanitize(int rows)
+{
+	return rows >= 1024 ? 1024 : rows >= 512 ? 512 : 256;
+}
+
+static inline uint32_t hdr_rows_shift(uint32_t rows)
+{
+	return rows >= 1024 ? 0 : rows >= 512 ? 1 : 2;
+}
+
 // RGBA label images (row 0 = top) for overlaying on scopes. Caller frees with bfree.
+// `levels` is the axis length in pixels; 10-bit codes are mapped onto it (1024 codes -> levels px).
+// Labels that would collide are dropped, reference labels have priority.
 // Vertical: height `levels`, text placed just above each mark (code increases upward).
 uint8_t *hdr_scale_label_image_vertical(const struct hdr_scale_mark *marks, int n, uint32_t levels,
 					uint32_t glyph_scale, uint32_t *width);

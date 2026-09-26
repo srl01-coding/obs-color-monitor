@@ -16,6 +16,7 @@ void draw_texture_blended(gs_texture_t *tex, float x, float y);
 
 // HDR scale properties shared by waveform and histogram
 obs_property_t *properties_add_hdr_scale(obs_properties_t *props);
+obs_property_t *properties_add_hdr_resolution(obs_properties_t *props, const char *name, const char *desc);
 
 #ifdef __cplusplus
 }

@@ -47,7 +47,7 @@ struct his_source
 	uint32_t tex_hi_levels;
 	uint8_t *tex_buf[2];
 	uint32_t hi_max[2][3];
-	uint32_t tex_buf_levels[2]; // 256 (8-bit SDR) or 1024 (10-bit HLG)
+	uint32_t tex_buf_levels[2]; // display columns: 256 (SDR), hdr_cols (HLG)
 	bool tex_buf_hlg[2];
 	bool tex_buf_full_range[2];
 	volatile int w_tex_buf;
@@ -58,6 +58,7 @@ struct his_source
 	uint32_t label_height;
 	int hdr_scale;
 	bool hdr_labels;
+	uint32_t hdr_cols; // HLG: 256, 512 or 1024 bins; 10-bit codes are binned 4, 2 or 1 per bin
 	uint32_t graticule_key_prev;
 
 	int display;
@@ -184,6 +185,7 @@ static void his_update(void *data, obs_data_t *settings)
 		    src->graticule_need_update);
 	UPDATE_PROP(int, src->hdr_scale, (int)obs_data_get_int(settings, "hdr_scale"), src->graticule_need_update);
 	UPDATE_PROP(bool, src->hdr_labels, obs_data_get_bool(settings, "hdr_labels"), src->graticule_need_update);
+	src->hdr_cols = hdr_rows_sanitize((int)obs_data_get_int(settings, "hdr_cols"));
 
 #undef UPDATE_PROP
 }
@@ -198,6 +200,7 @@ static void his_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "level_ratio_value", 10.0);
 	obs_data_set_default_int(settings, "hdr_scale", HDR_SCALE_HLG_PERCENT);
 	obs_data_set_default_bool(settings, "hdr_labels", true);
+	obs_data_set_default_int(settings, "hdr_cols", 256);
 }
 
 static bool components_changed(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
@@ -319,6 +322,7 @@ static obs_properties_t *his_get_properties(void *data)
 	graticule_horizontal_combo_init(prop, 1.0f / GRATICULE_H_MAX, 50.0f, "%");
 
 	properties_add_hdr_scale(props);
+	properties_add_hdr_resolution(props, "hdr_cols", obs_module_text("HDR.Resolution.Histogram"));
 
 	return props;
 }
@@ -391,7 +395,8 @@ static inline void his_draw_histogram(struct his_source *src, uint8_t *tex_buf, 
 {
 	const uint32_t height = surface_data->height;
 	const uint32_t width = surface_data->width;
-	const uint32_t levels = surface_data->levels;
+	const uint32_t levels = surface_data->hlg ? src->hdr_cols : HI_SIZE;
+	const uint32_t shift = hdr_rows_shift(levels); // 10-bit code -> bin
 
 	uint32_t *dbuf = (uint32_t *)tex_buf;
 	for (uint32_t i = 0; i < levels * 4; i++)
@@ -417,11 +422,11 @@ static inline void his_draw_histogram(struct his_source *src, uint8_t *tex_buf, 
 			if (!a)
 				continue;
 			if (calc_r)
-				dbuf[r * 4 + 0]++;
+				dbuf[(r >> shift) * 4 + 0]++;
 			if (calc_g)
-				dbuf[g * 4 + 1]++;
+				dbuf[(g >> shift) * 4 + 1]++;
 			if (calc_b)
-				dbuf[b * 4 + 2]++;
+				dbuf[(b >> shift) * 4 + 2]++;
 		}
 	}
 
@@ -504,7 +509,7 @@ static void his_surface_cb(void *data, struct cm_surface_data *surface_data)
 	PROFILE_START(prof_draw_histogram_name);
 	his_draw_histogram(src, src->tex_buf[src->w_tex_buf], src->hi_max[src->w_tex_buf], surface_data);
 	PROFILE_END(prof_draw_histogram_name);
-	src->tex_buf_levels[src->w_tex_buf] = surface_data->levels;
+	src->tex_buf_levels[src->w_tex_buf] = surface_data->hlg ? src->hdr_cols : HI_SIZE;
 	src->tex_buf_hlg[src->w_tex_buf] = surface_data->hlg;
 	src->tex_buf_full_range[src->w_tex_buf] = surface_data->full_range;
 	src->w_tex_buf ^= 1;
@@ -550,15 +555,15 @@ static void create_graticule_vbuf(struct his_source *src)
 			for (int i = 0; i < n_marks; i++) {
 				if (!marks[i].ref)
 					continue;
-				gs_vertex2f(marks[i].code + 0.5f, 0.0f);
-				gs_vertex2f(marks[i].code + 0.5f, 1.0f);
+				gs_vertex2f(hdr_scale_code_to_px(marks[i].code, levels), 0.0f);
+				gs_vertex2f(hdr_scale_code_to_px(marks[i].code, levels), 1.0f);
 			}
 			src->graticule_ref_vbuf = gs_render_save();
 		}
 
 		if (src->hdr_labels && n_marks > 0) {
 			uint32_t h = 0;
-			uint8_t *img = hdr_scale_label_image_horizontal(marks, n_marks, levels, 3, &h);
+			uint8_t *img = hdr_scale_label_image_horizontal(marks, n_marks, levels, levels / 256, &h);
 			const uint8_t *data = img;
 			src->label_tex = gs_texture_create(levels, h, GS_RGBA, 1, &data, 0);
 			src->label_height = h;
@@ -575,8 +580,8 @@ static void create_graticule_vbuf(struct his_source *src)
 		for (int i = 0; i < n_marks; i++) {
 			if (marks[i].ref)
 				continue;
-			gs_vertex2f(marks[i].code + 0.5f, 0.0f);
-			gs_vertex2f(marks[i].code + 0.5f, 1.0f);
+			gs_vertex2f(hdr_scale_code_to_px(marks[i].code, levels), 0.0f);
+			gs_vertex2f(hdr_scale_code_to_px(marks[i].code, levels), 1.0f);
 		}
 	} else if (has_graticule_vertical) {
 		const int n = src->graticule_vertical_lines;
