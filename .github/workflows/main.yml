@@ -1,11 +1,13 @@
 name: Plugin Build
 
 on:
+  workflow_dispatch:
   push:
     paths-ignore:
       - '**.md'
     branches:
       - main
+      - 'hdr-*'
     tags:
       - '*'
   pull_request:
