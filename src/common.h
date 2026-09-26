@@ -27,7 +27,23 @@ struct cm_surface_data
 	uint32_t linesize, width, height;
 	int colorspace;
 	gs_texture_t *tex; // for bypass mode
+
+	// HDR (HLG) path: pixels are packed GS_R10G10B10A2 (R bits 0-9, G 10-19,
+	// B 20-29, A 30-31) instead of 8-bit BGRA. Channel roles match the 8-bit
+	// path: R=R or V(Cr), G=G or Y, B=B or U(Cb).
+	bool hlg;
+	bool full_range;
+	uint32_t levels; // 256 for 8-bit SDR, 1024 for 10-bit HLG
 };
+
+static inline void cm_unpack_r10g10b10a2(const uint8_t *p, uint32_t *r, uint32_t *g, uint32_t *b, uint32_t *a)
+{
+	const uint32_t w = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+	*r = w & 0x3FF;
+	*g = (w >> 10) & 0x3FF;
+	*b = (w >> 20) & 0x3FF;
+	*a = w >> 30;
+}
 
 typedef void (*cm_surface_cb_t)(void *data, struct cm_surface_data *surface_data);
 
@@ -38,6 +54,10 @@ struct cm_surface_queue_item
 	uint32_t width, height, sheight;
 	uint32_t flags; // RGB or YUV
 	int colorspace;
+	bool hlg;
+	bool full_range;
+	enum gs_color_format texrender_format;
+	enum gs_color_format stagesurface_format;
 
 	cm_surface_cb_t cb;
 	void *cb_data;
@@ -55,8 +75,11 @@ struct cm_source
 	volatile int i_read_queue;
 	int i_bypass_queue;
 	gs_texrender_t *texrender;
+	enum gs_color_format texrender_format;
 	uint32_t texrender_width, texrender_height;
 	gs_effect_t *effect;
+	bool hlg;        // canvas is Rec.2100 HLG; updated every render
+	bool full_range; // canvas uses full range
 	bool rendered;
 	int x0, x1, y0, y1; // for ROI
 

@@ -36,16 +36,20 @@ histogram.c, *.effect) are identical in both.
    0..256 vertex buffer in C.
 ROI sources (`roi.c`) share `cm.texrender`, so they inherit whatever common.c does.
 
-## Planned design
-- Capture texrenders -> `GS_RGBA16F`, begin_with_color_space(GS_CS_709_EXTENDED)
-  when the canvas is HDR.
-- New technique in common.effect: linear 709_EXTENDED -> BT.2020 primaries -> HLG
-  OETF (+ inverse of OBS's scaling) -> optional BT.2020 Y'CbCr -> narrow-range.
-- Stage the encoded result as `GS_R10G10B10A2` (exact 10-bit codes, half the
-  readback of RGBA16F) or `GS_RGBA16F` if superwhite beyond code 1023 is needed.
-- CPU binning: 1024 levels (WV_SIZE/HI_SIZE become runtime values), uint16
-  accumulators; waveform texture format changes accordingly.
-- Graticule labels per scale mode.
+## Implemented (commit "HLG capture path + HLG%/10-bit scales")
+- HLG mode is automatic when `ovi.colorspace == VIDEO_CS_2100_HLG`; SDR path unchanged.
+- common.c: capture `GS_RGBA16F` in `GS_CS_709_EXTENDED`; encode with
+  `ConvertRGB_HLG` / `ConvertRGB_YUV2020_HLG` (common.effect, HLG code copied from
+  libobs color.effect incl. inverse OOTF and >1000-nit EETF); stage `GS_R10G10B10A2`.
+  Params: `obs_get_video_sdr_white_level()/10000`, `obs_get_video_hdr_nominal_peak_level()`,
+  narrow/full range from `ovi.range`.
+- `cm_surface_data.hlg/full_range/levels`; `cm_unpack_r10g10b10a2()` in common.h.
+- waveform/histogram: 1024 bins in HLG, properties `hdr_scale` (HLG % / 10-bit code)
+  and `hdr_labels`; graticule marks + 5x7 bitmap labels in `src/hdr-scale.c`.
+  Cyan = reference lines (0%, 75% BT.2408 ref white, 100%; or 64/940).
+- vectorscope: decodes 10-bit (>>2) so it doesn't show garbage; graticule still 601/709.
+- Known gaps: PQ canvas uses legacy SDR path; zebra/false colour/focus peaking
+  bypass textures carry the HLG signal in HLG mode (untested); ROI display untested.
 
 ## Build / test
 - No local toolchain. CI (`.github/workflows/main.yml`, "Plugin Build") runs on

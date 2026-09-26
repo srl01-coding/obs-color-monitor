@@ -223,6 +223,23 @@ static inline void vss_draw_vectorscope(uint8_t *dbuf, struct cm_surface_data *s
 	const uint32_t width = surface_data->width;
 	uint8_t *vd = surface_data->yuv_data;
 	uint32_t vd_add = surface_data->linesize - width * 4;
+
+	if (surface_data->hlg) {
+		// 10-bit BT.2020 Y'CbCr from the HLG path, reduced to the 8-bit grid.
+		// NOTE: the graticule targets are still BT.601/709; not HDR-correct yet.
+		for (uint32_t y = 0; y < height; y++) {
+			for (uint32_t x = 0; x < width; x++, vd += 4) {
+				uint32_t v, luma, u, a;
+				cm_unpack_r10g10b10a2(vd, &v, &luma, &u, &a);
+				uint8_t *c = dbuf + ((u >> 2) + VS_SIZE * (255 - (v >> 2)));
+				if (*c < 255)
+					++*c;
+			}
+			vd += vd_add;
+		}
+		return;
+	}
+
 	for (uint32_t y = 0; y < height; y++) {
 		for (uint32_t x = 0; x < width; x++) {
 			const uint8_t u = *vd++;

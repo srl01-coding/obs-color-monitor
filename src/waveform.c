@@ -4,6 +4,7 @@
 #include <graphics/matrix4.h>
 #include "common.h"
 #include "util.h"
+#include "hdr-scale.h"
 
 #ifdef ENABLE_PROFILE
 #define PROFILE_START(x) profile_start(x)
@@ -35,18 +36,39 @@ struct wvs_source
 	gs_effect_t *effect;
 	gs_texture_t *tex_wv;
 	uint32_t tex_wv_width;
+	uint32_t tex_wv_levels;
 	uint8_t *tex_buf[2];
 	uint32_t tex_buf_width[2];
+	uint32_t tex_buf_levels[2]; // 256 (8-bit SDR) or 1024 (10-bit HLG)
+	bool tex_buf_hlg[2];
+	bool tex_buf_full_range[2];
 	volatile int w_tex_buf;
 	int r_tex_buf;
 
 	gs_vertbuffer_t *graticule_line_vbuf;
+	gs_vertbuffer_t *graticule_ref_vbuf; // HLG: black, nominal peak, reference white
+	gs_texture_t *label_tex;
+	uint32_t label_width;
 
 	int display;
 	uint32_t components;
 	int intensity;
-	int graticule_lines, graticule_lines_prev;
+	int graticule_lines;
+	int hdr_scale;
+	bool hdr_labels;
+	uint32_t graticule_key_prev;
 };
+
+static inline uint32_t cur_levels(const struct wvs_source *src)
+{
+	uint32_t levels = src->tex_buf_levels[src->r_tex_buf];
+	return levels ? levels : WV_SIZE;
+}
+
+static inline bool cur_hlg(const struct wvs_source *src)
+{
+	return src->tex_buf_hlg[src->r_tex_buf];
+}
 
 static void wvs_update(void *, obs_data_t *);
 static void wvs_surface_cb(void *data, struct cm_surface_data *surface_data);
@@ -80,6 +102,8 @@ static void wvs_destroy(void *data)
 	obs_enter_graphics();
 	gs_texture_destroy(src->tex_wv);
 	gs_vertexbuffer_destroy(src->graticule_line_vbuf);
+	gs_vertexbuffer_destroy(src->graticule_ref_vbuf);
+	gs_texture_destroy(src->label_tex);
 	obs_leave_graphics();
 
 	cm_destroy(&src->cm);
@@ -106,6 +130,8 @@ static void wvs_update(void *data, obs_data_t *settings)
 		src->intensity = 1;
 
 	src->graticule_lines = (int)obs_data_get_int(settings, "graticule_lines");
+	src->hdr_scale = (int)obs_data_get_int(settings, "hdr_scale");
+	src->hdr_labels = obs_data_get_bool(settings, "hdr_labels");
 }
 
 static void wvs_get_defaults(obs_data_t *settings)
@@ -114,6 +140,8 @@ static void wvs_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "intensity", 51);
 	obs_data_set_default_int(settings, "components", COMP_RGB);
 	obs_data_set_default_int(settings, "graticule_lines", 5);
+	obs_data_set_default_int(settings, "hdr_scale", HDR_SCALE_HLG_PERCENT);
+	obs_data_set_default_bool(settings, "hdr_labels", true);
 }
 
 static bool components_changed(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
@@ -166,6 +194,8 @@ static obs_properties_t *wvs_get_properties(void *data)
 	obs_property_list_add_int(prop, obs_module_text("Graticule.Step.20"), 5);
 	obs_property_list_add_int(prop, obs_module_text("Graticule.Step.10"), 10);
 
+	properties_add_hdr_scale(props);
+
 	return props;
 }
 
@@ -194,8 +224,8 @@ static uint32_t wvs_get_height(void *data)
 	if (src->cm.bypass)
 		return cm_bypass_get_height(&src->cm);
 	if (src->display == DISP_STACK)
-		return WV_SIZE * n_components(src);
-	return WV_SIZE;
+		return cur_levels(src) * n_components(src);
+	return cur_levels(src);
 }
 
 static inline void inc_uint8(uint8_t *c)
@@ -204,17 +234,46 @@ static inline void inc_uint8(uint8_t *c)
 		++*c;
 }
 
-static inline void ensure_tex_buf_size(struct wvs_source *src, const uint32_t width, int ix)
+static inline void ensure_tex_buf_size(struct wvs_source *src, const uint32_t width, const uint32_t levels, int ix)
 {
-	if (src->tex_buf[ix] && src->tex_buf_width[ix] == width)
+	if (src->tex_buf[ix] && src->tex_buf_width[ix] == width && src->tex_buf_levels[ix] == levels)
 		return;
 
 	if (!width)
 		return;
 
 	bfree(src->tex_buf[ix]);
-	src->tex_buf[ix] = bzalloc(width * WV_SIZE * 4);
+	src->tex_buf[ix] = bzalloc(width * levels * 4);
 	src->tex_buf_width[ix] = width;
+	src->tex_buf_levels[ix] = levels;
+}
+
+static inline void wvs_draw_waveform_10bit(struct wvs_source *src, uint8_t *dbuf,
+					   const struct cm_surface_data *surface_data, const uint8_t *video_data)
+{
+	const uint32_t height = surface_data->height;
+	const uint32_t width = surface_data->width;
+	const uint32_t top = surface_data->levels - 1;
+
+	const bool calc_b = (src->components & 0x11) ? true : false;
+	const bool calc_g = (src->components & 0x22) ? true : false;
+	const bool calc_r = (src->components & 0x44) ? true : false;
+
+	for (uint32_t y = 0; y < height; y++) {
+		const uint8_t *v = video_data + surface_data->linesize * y;
+		for (uint32_t x = 0; x < width; x++, v += 4) {
+			uint32_t r, g, b, a;
+			cm_unpack_r10g10b10a2(v, &r, &g, &b, &a);
+			if (!a)
+				continue;
+			if (calc_b)
+				inc_uint8(dbuf + x * 4 + (top - b) * width * 4 + 0);
+			if (calc_g)
+				inc_uint8(dbuf + x * 4 + (top - g) * width * 4 + 1);
+			if (calc_r)
+				inc_uint8(dbuf + x * 4 + (top - r) * width * 4 + 2);
+		}
+	}
 }
 
 static inline void wvs_draw_waveform(struct wvs_source *src, uint8_t *dbuf, const struct cm_surface_data *surface_data)
@@ -222,7 +281,7 @@ static inline void wvs_draw_waveform(struct wvs_source *src, uint8_t *dbuf, cons
 	const uint32_t height = surface_data->height;
 	const uint32_t width = surface_data->width;
 
-	for (uint32_t i = 0; i < width * WV_SIZE * 4; i++)
+	for (uint32_t i = 0; i < width * surface_data->levels * 4; i++)
 		dbuf[i] = 0;
 
 	const uint8_t *video_data = NULL;
@@ -232,6 +291,11 @@ static inline void wvs_draw_waveform(struct wvs_source *src, uint8_t *dbuf, cons
 		video_data = surface_data->yuv_data;
 	if (!video_data)
 		return;
+
+	if (surface_data->hlg) {
+		wvs_draw_waveform_10bit(src, dbuf, surface_data, video_data);
+		return;
+	}
 
 	const bool calc_b = (src->components & 0x11) ? true : false;
 	const bool calc_g = (src->components & 0x22) ? true : false;
@@ -256,17 +320,18 @@ static inline void wvs_draw_waveform(struct wvs_source *src, uint8_t *dbuf, cons
 	}
 }
 
-static void wvs_set_image(struct wvs_source *src, const uint8_t *tex_buf, uint32_t width)
+static void wvs_set_image(struct wvs_source *src, const uint8_t *tex_buf, uint32_t width, uint32_t levels)
 {
-	if (src->tex_wv && src->tex_wv_width == width) {
+	if (src->tex_wv && src->tex_wv_width == width && src->tex_wv_levels == levels) {
 		gs_texture_set_image(src->tex_wv, tex_buf, width * 4, false);
 		return;
 	}
 
 	if (src->tex_wv)
 		gs_texture_destroy(src->tex_wv);
-	src->tex_wv = gs_texture_create(width, WV_SIZE, GS_BGRX, 1, &tex_buf, GS_DYNAMIC);
+	src->tex_wv = gs_texture_create(width, levels, GS_BGRX, 1, &tex_buf, GS_DYNAMIC);
 	src->tex_wv_width = width;
+	src->tex_wv_levels = levels;
 }
 
 static void wvs_surface_cb(void *data, struct cm_surface_data *surface_data)
@@ -280,12 +345,53 @@ static void wvs_surface_cb(void *data, struct cm_surface_data *surface_data)
 	if (!surface_data->width)
 		return;
 
-	ensure_tex_buf_size(src, surface_data->width, src->w_tex_buf);
+	const uint32_t levels = surface_data->levels ? surface_data->levels : WV_SIZE;
+	ensure_tex_buf_size(src, surface_data->width, levels, src->w_tex_buf);
 
 	PROFILE_START(prof_draw_waveform_name);
 	wvs_draw_waveform(src, src->tex_buf[src->w_tex_buf], surface_data);
 	PROFILE_END(prof_draw_waveform_name);
+	src->tex_buf_hlg[src->w_tex_buf] = surface_data->hlg;
+	src->tex_buf_full_range[src->w_tex_buf] = surface_data->full_range;
 	src->w_tex_buf ^= 1;
+}
+
+static void create_graticule_hlg(struct wvs_source *src)
+{
+	const uint32_t levels = cur_levels(src);
+	struct hdr_scale_mark marks[HDR_SCALE_MAX_MARKS];
+	const int n =
+		hdr_scale_marks(marks, src->hdr_scale, src->graticule_lines, src->tex_buf_full_range[src->r_tex_buf]);
+
+	for (int pass = 0; pass < 2; pass++) {
+		const bool ref = pass == 1;
+		int count = 0;
+		for (int i = 0; i < n; i++)
+			count += marks[i].ref == ref;
+		if (!count)
+			continue;
+		gs_render_start(true);
+		for (int i = 0; i < n; i++) {
+			if (marks[i].ref != ref)
+				continue;
+			const float y = (float)(levels - 1) - marks[i].code + 0.5f;
+			gs_vertex2f(0.0f, y);
+			gs_vertex2f(1.0f, y);
+		}
+		if (ref)
+			src->graticule_ref_vbuf = gs_render_save();
+		else
+			src->graticule_line_vbuf = gs_render_save();
+	}
+
+	if (src->hdr_labels && n > 0) {
+		uint32_t w = 0;
+		uint8_t *img = hdr_scale_label_image_vertical(marks, n, levels, levels / 256, &w);
+		const uint8_t *data = img;
+		src->label_tex = gs_texture_create(w, levels, GS_RGBA, 1, &data, 0);
+		src->label_width = w;
+		bfree(img);
+	}
 }
 
 static void create_graticule_vbuf(struct wvs_source *src)
@@ -293,7 +399,13 @@ static void create_graticule_vbuf(struct wvs_source *src)
 	obs_enter_graphics();
 	gs_vertexbuffer_destroy(src->graticule_line_vbuf);
 	src->graticule_line_vbuf = NULL;
-	if (src->graticule_lines > 0) {
+	gs_vertexbuffer_destroy(src->graticule_ref_vbuf);
+	src->graticule_ref_vbuf = NULL;
+	gs_texture_destroy(src->label_tex);
+	src->label_tex = NULL;
+	if (cur_hlg(src)) {
+		create_graticule_hlg(src);
+	} else if (src->graticule_lines > 0) {
 		gs_render_start(true);
 		for (int i = 0; i <= src->graticule_lines; i++) {
 			gs_vertex2f(0.0f, 256.0f * i / src->graticule_lines);
@@ -304,8 +416,51 @@ static void create_graticule_vbuf(struct wvs_source *src)
 	obs_leave_graphics();
 }
 
+static void wvs_render_graticule_hlg(struct wvs_source *src)
+{
+	const bool stack = src->display == DISP_STACK;
+	const bool parade = src->display == DISP_PARADE;
+	const int n_stack = stack ? n_components(src) : 1;
+	const uint32_t levels = cur_levels(src);
+	const float xcoe = (float)(src->tex_buf_width[src->r_tex_buf] * (parade ? n_components(src) : 1));
+
+	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_SOLID);
+	for (int pass = 0; pass < 2; pass++) {
+		gs_vertbuffer_t *vbuf = pass ? src->graticule_ref_vbuf : src->graticule_line_vbuf;
+		if (!vbuf)
+			continue;
+		gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"),
+				    pass ? 0xC040E0FF /* cyan */ : 0x80FFBF00 /* amber */);
+		while (gs_effect_loop(effect, "Solid")) {
+			for (int i = 0; i < n_stack; i++) {
+				struct matrix4 tr = {
+					{.ptr = {xcoe, 0.0f, 0.0f, 0.0f}},
+					{.ptr = {0.0f, 1.0f, 0.0f, 0.0f}},
+					{.ptr = {0.0f, 0.0f, 1.0f, 0.0f}},
+					{.ptr = {0.0f, (float)(levels * i), 0.0f, 1.0f}},
+				};
+				gs_matrix_push();
+				gs_matrix_mul(&tr);
+				gs_load_vertexbuffer(vbuf);
+				gs_draw(GS_LINES, 0, 0);
+				gs_matrix_pop();
+			}
+		}
+	}
+
+	if (src->label_tex) {
+		for (int i = 0; i < n_stack; i++)
+			draw_texture_blended(src->label_tex, 0.0f, (float)(levels * i));
+	}
+}
+
 static void wvs_render_graticule(struct wvs_source *src)
 {
+	if (cur_hlg(src)) {
+		wvs_render_graticule_hlg(src);
+		return;
+	}
+
 	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_SOLID);
 	gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0x80FFBF00); // amber
 	while (gs_effect_loop(effect, "Solid")) {
@@ -313,7 +468,7 @@ static void wvs_render_graticule(struct wvs_source *src)
 		bool parade = src->display == DISP_PARADE;
 		int n_stack = stack ? n_components(src) : 1;
 		for (int i = 0; i < n_stack; i++) {
-			const float yoff = stack ? WV_SIZE * i + 0.5f : 0.0f;
+			const float yoff = stack ? cur_levels(src) * i + 0.5f : 0.0f;
 			const float xcoe =
 				(float)(src->tex_buf_width[src->r_tex_buf] * (parade ? n_components(src) : 1));
 			struct matrix4 tr = {
@@ -338,7 +493,7 @@ static void render_waveform(struct wvs_source *src)
 	gs_effect_set_float(gs_effect_get_param_by_name(effect, "intensity"), (float)src->intensity);
 	const char *name = "Draw";
 	int w = src->tex_wv_width;
-	int h = WV_SIZE;
+	int h = src->tex_wv_levels;
 	int n = n_components(src);
 	if (src->effect)
 		switch (src->display) {
@@ -373,16 +528,21 @@ static void wvs_render(void *data, gs_effect_t *effect)
 
 	PROFILE_START(prof_draw_name);
 	if (src->tex_buf[src->r_tex_buf]) {
-		wvs_set_image(src, src->tex_buf[src->r_tex_buf], src->tex_buf_width[src->r_tex_buf]);
+		wvs_set_image(src, src->tex_buf[src->r_tex_buf], src->tex_buf_width[src->r_tex_buf], cur_levels(src));
 		render_waveform(src);
 	}
 	PROFILE_END(prof_draw_name);
 
 	PROFILE_START(prof_draw_graticule_name);
 	if (src->graticule_lines > 0) {
-		if (src->graticule_lines != src->graticule_lines_prev) {
+		// Rebuild when anything affecting the graticule changes.
+		uint32_t key = (uint32_t)src->graticule_lines;
+		if (cur_hlg(src))
+			key |= 0x100u | ((uint32_t)src->hdr_scale << 9) | ((uint32_t)src->hdr_labels << 10) |
+			       ((uint32_t)src->tex_buf_full_range[src->r_tex_buf] << 11) | (cur_levels(src) << 12);
+		if (key != src->graticule_key_prev) {
 			create_graticule_vbuf(src);
-			src->graticule_lines_prev = src->graticule_lines;
+			src->graticule_key_prev = key;
 		}
 		wvs_render_graticule(src);
 	}

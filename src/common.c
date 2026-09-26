@@ -127,22 +127,48 @@ void cm_get_properties(struct cm_source *src, obs_properties_t *props)
 		obs_properties_add_bool(props, "bypass", obs_module_text("Bypass"));
 }
 
-static void prepare_stagesurface(struct cm_surface_queue_item *item, uint32_t width, uint32_t height, uint32_t sheight)
+static void prepare_stagesurface(struct cm_surface_queue_item *item, uint32_t width, uint32_t height, uint32_t sheight,
+				 enum gs_color_format format)
 {
-	if (width != item->width || sheight != item->sheight || !item->stagesurface) {
+	if (width != item->width || sheight != item->sheight || format != item->stagesurface_format ||
+	    !item->stagesurface) {
 		gs_stagesurface_destroy(item->stagesurface);
-		item->stagesurface = gs_stagesurface_create(width, sheight, GS_BGRA);
+		item->stagesurface = gs_stagesurface_create(width, sheight, format);
 		item->width = width;
 		item->sheight = sheight;
+		item->stagesurface_format = format;
 	}
 	item->height = height;
 }
 
+static void ensure_texrender(gs_texrender_t **texrender, enum gs_color_format *current, enum gs_color_format format)
+{
+	if (*texrender && *current == format)
+		return;
+	if (*texrender)
+		gs_texrender_destroy(*texrender);
+	*texrender = gs_texrender_create(format, GS_ZS_NONE);
+	*current = format;
+}
+
+static void update_hdr_state(struct cm_source *src)
+{
+	struct obs_video_info ovi;
+	if (obs_get_video_info(&ovi)) {
+		src->hlg = ovi.colorspace == VIDEO_CS_2100_HLG;
+		src->full_range = ovi.range == VIDEO_RANGE_FULL;
+	} else {
+		src->hlg = false;
+		src->full_range = false;
+	}
+}
+
 static bool render_target_to_texrender(obs_source_t *target, uint32_t target_width, uint32_t target_height,
-				       gs_texrender_t *texrender, uint32_t width, uint32_t height)
+				       gs_texrender_t *texrender, uint32_t width, uint32_t height,
+				       enum gs_color_space space)
 {
 	gs_texrender_reset(texrender);
-	if (!gs_texrender_begin(texrender, width, height))
+	if (!gs_texrender_begin_with_color_space(texrender, width, height, space))
 		return false;
 
 	struct vec4 background;
@@ -167,10 +193,22 @@ static bool render_target_to_texrender(obs_source_t *target, uint32_t target_wid
 	return true;
 }
 
+static void set_hlg_params(struct cm_source *src)
+{
+	gs_effect_t *e = src->effect;
+	const float sdr_white = obs_get_video_sdr_white_level();
+	const float peak = obs_get_video_hdr_nominal_peak_level();
+	gs_effect_set_float(gs_effect_get_param_by_name(e, "sdr_white_nits_over_maximum"), sdr_white / 10000.0f);
+	gs_effect_set_float(gs_effect_get_param_by_name(e, "hdr_lw"), peak);
+	// Output is code / 1023 so that the UNORM10 target stores the exact code value.
+	gs_effect_set_float(gs_effect_get_param_by_name(e, "y_scale"), src->full_range ? 1.0f : 876.0f / 1023.0f);
+	gs_effect_set_float(gs_effect_get_param_by_name(e, "y_offset"), src->full_range ? 0.0f : 64.0f / 1023.0f);
+	gs_effect_set_float(gs_effect_get_param_by_name(e, "c_scale"), src->full_range ? 1.0f : 896.0f / 1023.0f);
+}
+
 static bool render_rgb_yuv(struct cm_source *src, struct cm_surface_queue_item *item, uint32_t x, uint32_t y)
 {
-	if (!item->texrender)
-		item->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+	ensure_texrender(&item->texrender, &item->texrender_format, item->hlg ? GS_R10G10B10A2 : GS_BGRA);
 
 	gs_texrender_reset(item->texrender);
 	if (src->effect && gs_texrender_begin(item->texrender, item->width, item->sheight)) {
@@ -188,7 +226,18 @@ static bool render_rgb_yuv(struct cm_source *src, struct cm_surface_queue_item *
 
 			uint32_t offset = 0;
 
-			if (item->flags & (CM_FLAG_CONVERT_RGB | CM_FLAG_RAW_TEXTURE)) {
+			if (item->hlg)
+				set_hlg_params(src);
+
+			if (item->hlg && (item->flags & (CM_FLAG_CONVERT_RGB | CM_FLAG_RAW_TEXTURE))) {
+				// Linear 709_EXTENDED -> BT.2020 -> HLG R'G'B' as 10-bit code values
+				gs_effect_set_texture(gs_effect_get_param_by_name(src->effect, "image"), tex);
+				while (gs_effect_loop(src->effect, "ConvertRGB_HLG")) {
+					gs_draw_sprite_subregion(tex, 0, x, y, item->width, item->height);
+				}
+
+				offset += item->height;
+			} else if (item->flags & (CM_FLAG_CONVERT_RGB | CM_FLAG_RAW_TEXTURE)) {
 				gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 
 				gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), tex);
@@ -204,8 +253,9 @@ static bool render_rgb_yuv(struct cm_source *src, struct cm_surface_queue_item *
 					gs_matrix_translate3f(0.0f, (float)offset, 0.0f);
 				}
 
-				const char *conversion = src->colorspace == 1 ? "ConvertRGB_YUV601"
-									      : "ConvertRGB_YUV709";
+				const char *conversion = item->hlg              ? "ConvertRGB_YUV2020_HLG"
+							 : src->colorspace == 1 ? "ConvertRGB_YUV601"
+										: "ConvertRGB_YUV709";
 				gs_effect_set_texture(gs_effect_get_param_by_name(src->effect, "image"), tex);
 				while (gs_effect_loop(src->effect, conversion)) {
 					gs_draw_sprite_subregion(tex, 0, x, y, item->width, item->height);
@@ -235,6 +285,8 @@ void cm_render_target(struct cm_source *src)
 	obs_source_t *target = src->weak_target ? obs_weak_source_get_source(src->weak_target) : NULL;
 	if (!target && *src->target_name)
 		return;
+
+	update_hdr_state(src);
 
 	uint32_t target_width, target_height;
 	if (target) {
@@ -294,14 +346,17 @@ void cm_render_target(struct cm_source *src)
 	item->flags = src->bypass ? CM_FLAG_RAW_TEXTURE
 				  : src->flags & (CM_FLAG_CONVERT_RGB | CM_FLAG_CONVERT_YUV | CM_FLAG_RAW_TEXTURE);
 	item->colorspace = src->colorspace;
+	item->hlg = src->hlg;
+	item->full_range = src->full_range;
 
-	prepare_stagesurface(item, cx, cy, sheight);
+	prepare_stagesurface(item, cx, cy, sheight, src->hlg ? GS_R10G10B10A2 : GS_BGRA);
 
-	if (!src->texrender)
-		src->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+	// In HLG mode keep the picture in OBS's linear HDR space (1.0 = SDR white)
+	// so nothing above SDR white is clipped or tone-mapped before analysis.
+	ensure_texrender(&src->texrender, &src->texrender_format, src->hlg ? GS_RGBA16F : GS_BGRA);
 
 	if (!render_target_to_texrender(target, target_width, target_height, src->texrender, scaled_width,
-					scaled_height)) {
+					scaled_height, src->hlg ? GS_CS_709_EXTENDED : GS_CS_SRGB)) {
 		obs_source_release(target);
 		return;
 	}
@@ -354,6 +409,9 @@ static void cm_pipeline_thread_loop(struct cm_surface_queue_item *item)
 		.width = item->width,
 		.height = item->height,
 		.colorspace = item->colorspace,
+		.hlg = item->hlg,
+		.full_range = item->full_range,
+		.levels = item->hlg ? 1024 : 256,
 	};
 	if (item->flags & CM_FLAG_CONVERT_RGB) {
 		surface_data.rgb_data = video_data;

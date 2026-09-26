@@ -55,6 +55,7 @@ set(PLUGIN_SOURCES
 	src/roi.c
 	src/common.c
 	src/util.c
+	src/hdr-scale.c
 	src/util-cpp.cc
 	src/obs-convenience.c
 	src/scope-dock.cpp

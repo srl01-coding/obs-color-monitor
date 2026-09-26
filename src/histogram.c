@@ -4,6 +4,7 @@
 #include <graphics/matrix4.h>
 #include "common.h"
 #include "util.h"
+#include "hdr-scale.h"
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -19,6 +20,7 @@ static const char *prof_draw_name = "draw";
 #endif // ! ENABLE_PROFILE
 
 #define HI_SIZE 256
+#define HI_SIZE_MAX 1024 // 10-bit HLG
 
 #define DISP_OVERLAY 0
 #define DISP_STACK 1
@@ -42,11 +44,21 @@ struct his_source
 	gs_effect_t *effect;
 	gs_texture_t *tex_hi;
 	struct vec3 vec_hi_max;
+	uint32_t tex_hi_levels;
 	uint8_t *tex_buf[2];
 	uint32_t hi_max[2][3];
+	uint32_t tex_buf_levels[2]; // 256 (8-bit SDR) or 1024 (10-bit HLG)
+	bool tex_buf_hlg[2];
+	bool tex_buf_full_range[2];
 	volatile int w_tex_buf;
 
 	gs_vertbuffer_t *graticule_line_vbuf;
+	gs_vertbuffer_t *graticule_ref_vbuf; // HLG: black, nominal peak, reference white
+	gs_texture_t *label_tex;
+	uint32_t label_height;
+	int hdr_scale;
+	bool hdr_labels;
+	uint32_t graticule_key_prev;
 
 	int display;
 	uint32_t components;
@@ -60,6 +72,17 @@ struct his_source
 };
 
 static void his_update(void *, obs_data_t *);
+
+static inline uint32_t cur_levels(const struct his_source *src)
+{
+	uint32_t levels = src->tex_buf_levels[src->w_tex_buf ^ 1];
+	return levels ? levels : HI_SIZE;
+}
+
+static inline bool cur_hlg(const struct his_source *src)
+{
+	return src->tex_buf_hlg[src->w_tex_buf ^ 1];
+}
 static void his_surface_cb(void *data, struct cm_surface_data *surface_data);
 
 static const char *his_get_name(void *unused)
@@ -90,6 +113,8 @@ static void his_destroy(void *data)
 	obs_enter_graphics();
 	gs_texture_destroy(src->tex_hi);
 	gs_vertexbuffer_destroy(src->graticule_line_vbuf);
+	gs_vertexbuffer_destroy(src->graticule_ref_vbuf);
+	gs_texture_destroy(src->label_tex);
 	obs_leave_graphics();
 
 	cm_destroy(&src->cm);
@@ -157,6 +182,8 @@ static void his_update(void *data, obs_data_t *settings)
 
 	UPDATE_PROP(int, src->graticule_vertical_lines, (int)obs_data_get_int(settings, "graticule_vertical_lines"),
 		    src->graticule_need_update);
+	UPDATE_PROP(int, src->hdr_scale, (int)obs_data_get_int(settings, "hdr_scale"), src->graticule_need_update);
+	UPDATE_PROP(bool, src->hdr_labels, obs_data_get_bool(settings, "hdr_labels"), src->graticule_need_update);
 
 #undef UPDATE_PROP
 }
@@ -169,6 +196,8 @@ static void his_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "graticule_vertical_lines", 5);
 	obs_data_set_default_int(settings, "level_fixed_value", 1000);
 	obs_data_set_default_double(settings, "level_ratio_value", 10.0);
+	obs_data_set_default_int(settings, "hdr_scale", HDR_SCALE_HLG_PERCENT);
+	obs_data_set_default_bool(settings, "hdr_labels", true);
 }
 
 static bool components_changed(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
@@ -289,6 +318,8 @@ static obs_properties_t *his_get_properties(void *data)
 				       OBS_COMBO_FORMAT_FLOAT);
 	graticule_horizontal_combo_init(prop, 1.0f / GRATICULE_H_MAX, 50.0f, "%");
 
+	properties_add_hdr_scale(props);
+
 	return props;
 }
 
@@ -307,8 +338,8 @@ static uint32_t his_get_width(void *data)
 	if (src->cm.bypass)
 		return cm_bypass_get_width(&src->cm);
 	if (src->display == DISP_PARADE)
-		return HI_SIZE * n_components(src);
-	return HI_SIZE;
+		return cur_levels(src) * n_components(src);
+	return cur_levels(src);
 }
 
 static uint32_t his_get_height(void *data)
@@ -327,7 +358,8 @@ static inline void inc_uint16(uint16_t *c)
 		++*c;
 }
 
-static inline void his_calculate_max(struct his_source *src, uint32_t *hi_max, const uint32_t *dbuf)
+static inline void his_calculate_max(struct his_source *src, uint32_t *hi_max, const uint32_t *dbuf,
+				     const uint32_t levels)
 {
 	const bool calc_b = (src->components & 0x11) ? true : false;
 	const bool calc_g = (src->components & 0x22) ? true : false;
@@ -336,7 +368,7 @@ static inline void his_calculate_max(struct his_source *src, uint32_t *hi_max, c
 	hi_max[0] = 1;
 	hi_max[1] = 1;
 	hi_max[2] = 1;
-	for (int i = 0; i < HI_SIZE; i++) {
+	for (uint32_t i = 0; i < levels; i++) {
 		if (calc_r && dbuf[i * 4 + 0] > hi_max[0])
 			hi_max[0] = dbuf[i * 4 + 0];
 		if (calc_g && dbuf[i * 4 + 1] > hi_max[1])
@@ -359,9 +391,10 @@ static inline void his_draw_histogram(struct his_source *src, uint8_t *tex_buf, 
 {
 	const uint32_t height = surface_data->height;
 	const uint32_t width = surface_data->width;
+	const uint32_t levels = surface_data->levels;
 
 	uint32_t *dbuf = (uint32_t *)tex_buf;
-	for (int i = 0; i < HI_SIZE * 4; i++)
+	for (uint32_t i = 0; i < levels * 4; i++)
 		dbuf[i] = 0;
 
 	const uint8_t *video_data = NULL;
@@ -376,7 +409,23 @@ static inline void his_draw_histogram(struct his_source *src, uint8_t *tex_buf, 
 	const bool calc_g = (src->components & 0x22) ? true : false;
 	const bool calc_r = (src->components & 0x44) ? true : false;
 
-	for (uint32_t y = 0; y < height; y++) {
+	for (uint32_t y = 0; y < height && surface_data->hlg; y++) {
+		const uint8_t *v = video_data + surface_data->linesize * y;
+		for (uint32_t x = 0; x < width; x++, v += 4) {
+			uint32_t r, g, b, a;
+			cm_unpack_r10g10b10a2(v, &r, &g, &b, &a);
+			if (!a)
+				continue;
+			if (calc_r)
+				dbuf[r * 4 + 0]++;
+			if (calc_g)
+				dbuf[g * 4 + 1]++;
+			if (calc_b)
+				dbuf[b * 4 + 2]++;
+		}
+	}
+
+	for (uint32_t y = 0; y < height && !surface_data->hlg; y++) {
 		const uint8_t *v = video_data + surface_data->linesize * y;
 		for (uint32_t x = 0; x < width; x++) {
 			const uint8_t b = *v++;
@@ -399,7 +448,7 @@ static inline void his_draw_histogram(struct his_source *src, uint8_t *tex_buf, 
 	else if (src->level_ratio_value > 0)
 		his_fix_max_level(hi_max, (uint64_t)width * height * src->level_ratio_value / 1000);
 	else
-		his_calculate_max(src, hi_max, dbuf);
+		his_calculate_max(src, hi_max, dbuf, levels);
 
 	float *flt = (float *)tex_buf;
 	if (src->logscale) {
@@ -407,23 +456,29 @@ static inline void his_draw_histogram(struct his_source *src, uint8_t *tex_buf, 
 			if (!(src->components & mask))
 				continue;
 			const float s = 1.0f / logf((float)(hi_max[j] + 1));
-			for (int i = 0; i < HI_SIZE; i++)
+			for (uint32_t i = 0; i < levels; i++)
 				flt[i * 4 + j] = dbuf[i * 4 + j] ? logf((float)(dbuf[i * 4 + j] + 1)) * s : 0;
 			hi_max[j] = 1;
 		}
 	} else {
-		for (int i = 0; i < HI_SIZE * 4; i++)
+		for (uint32_t i = 0; i < levels * 4; i++)
 			flt[i] = (float)dbuf[i];
 	}
 }
 
-static void his_set_image(struct his_source *src, const uint8_t *tex_buf, uint32_t *hi_max)
+static void his_set_image(struct his_source *src, const uint8_t *tex_buf, uint32_t *hi_max, uint32_t levels)
 {
+	if (src->tex_hi && src->tex_hi_levels != levels) {
+		gs_texture_destroy(src->tex_hi);
+		src->tex_hi = NULL;
+	}
 
-	if (!src->tex_hi)
-		src->tex_hi = gs_texture_create(HI_SIZE, 1, GS_RGBA32F, 1, &tex_buf, GS_DYNAMIC);
-	else
-		gs_texture_set_image(src->tex_hi, tex_buf, sizeof(float) * HI_SIZE * 4, false);
+	if (!src->tex_hi) {
+		src->tex_hi = gs_texture_create(levels, 1, GS_RGBA32F, 1, &tex_buf, GS_DYNAMIC);
+		src->tex_hi_levels = levels;
+	} else {
+		gs_texture_set_image(src->tex_hi, tex_buf, sizeof(float) * levels * 4, false);
+	}
 
 	for (int i = 0; i < 3; i++)
 		src->vec_hi_max.ptr[i] = (float)hi_max[i];
@@ -440,12 +495,18 @@ static void his_surface_cb(void *data, struct cm_surface_data *surface_data)
 	if (!surface_data->width)
 		return;
 
+	if (!surface_data->levels || surface_data->levels > HI_SIZE_MAX)
+		return;
+
 	if (!src->tex_buf[src->w_tex_buf])
-		src->tex_buf[src->w_tex_buf] = bzalloc(MAX(sizeof(uint32_t), sizeof(float)) * HI_SIZE * 4);
+		src->tex_buf[src->w_tex_buf] = bzalloc(MAX(sizeof(uint32_t), sizeof(float)) * HI_SIZE_MAX * 4);
 
 	PROFILE_START(prof_draw_histogram_name);
 	his_draw_histogram(src, src->tex_buf[src->w_tex_buf], src->hi_max[src->w_tex_buf], surface_data);
 	PROFILE_END(prof_draw_histogram_name);
+	src->tex_buf_levels[src->w_tex_buf] = surface_data->levels;
+	src->tex_buf_hlg[src->w_tex_buf] = surface_data->hlg;
+	src->tex_buf_full_range[src->w_tex_buf] = surface_data->full_range;
 	src->w_tex_buf ^= 1;
 }
 
@@ -465,13 +526,59 @@ static void create_graticule_vbuf(struct his_source *src)
 
 	gs_vertexbuffer_destroy(src->graticule_line_vbuf);
 	src->graticule_line_vbuf = NULL;
+	gs_vertexbuffer_destroy(src->graticule_ref_vbuf);
+	src->graticule_ref_vbuf = NULL;
+	gs_texture_destroy(src->label_tex);
+	src->label_tex = NULL;
+
+	const bool hlg = cur_hlg(src);
+	const uint32_t levels = cur_levels(src);
+	struct hdr_scale_mark marks[HDR_SCALE_MAX_MARKS];
+	int n_marks = 0;
+	if (hlg) {
+		n_marks = hdr_scale_marks(marks, src->hdr_scale, src->graticule_vertical_lines,
+					  src->tex_buf_full_range[src->w_tex_buf ^ 1]);
+		has_graticule_vertical = false;
+		for (int i = 0; i < n_marks; i++)
+			has_graticule_vertical |= !marks[i].ref;
+
+		bool has_ref = false;
+		for (int i = 0; i < n_marks; i++)
+			has_ref |= marks[i].ref;
+		if (has_ref) {
+			gs_render_start(true);
+			for (int i = 0; i < n_marks; i++) {
+				if (!marks[i].ref)
+					continue;
+				gs_vertex2f(marks[i].code + 0.5f, 0.0f);
+				gs_vertex2f(marks[i].code + 0.5f, 1.0f);
+			}
+			src->graticule_ref_vbuf = gs_render_save();
+		}
+
+		if (src->hdr_labels && n_marks > 0) {
+			uint32_t h = 0;
+			uint8_t *img = hdr_scale_label_image_horizontal(marks, n_marks, levels, 3, &h);
+			const uint8_t *data = img;
+			src->label_tex = gs_texture_create(levels, h, GS_RGBA, 1, &data, 0);
+			src->label_height = h;
+			bfree(img);
+		}
+	}
 
 	if (!has_graticule_vertical && !has_graticule_horizontal)
 		return;
 
 	gs_render_start(true);
 
-	if (has_graticule_vertical) {
+	if (hlg) {
+		for (int i = 0; i < n_marks; i++) {
+			if (marks[i].ref)
+				continue;
+			gs_vertex2f(marks[i].code + 0.5f, 0.0f);
+			gs_vertex2f(marks[i].code + 0.5f, 1.0f);
+		}
+	} else if (has_graticule_vertical) {
 		const int n = src->graticule_vertical_lines;
 		for (int i = 0; i <= n; i++) {
 			gs_vertex2f(256.0f * i / n, 0.0f);
@@ -482,17 +589,18 @@ static void create_graticule_vbuf(struct his_source *src)
 	if (has_graticule_horizontal) {
 		for (float y = 1.0f; y >= 0.0f; y -= y_step) {
 			gs_vertex2f(0.0f, y);
-			gs_vertex2f(256.0f, y);
+			gs_vertex2f((float)levels, y);
 		}
 	}
 
 	src->graticule_line_vbuf = gs_render_save();
 }
 
-static void his_render_graticule(struct his_source *src)
+static void his_render_graticule_vbuf(struct his_source *src, gs_vertbuffer_t *vbuf, uint32_t color, bool hlg)
 {
 	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_SOLID);
-	gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), 0x80FFBF00); // amber
+	gs_effect_set_color(gs_effect_get_param_by_name(effect, "color"), color);
+	const uint32_t levels = cur_levels(src);
 	while (gs_effect_loop(effect, "Solid")) {
 		bool stack = src->display == DISP_STACK;
 		bool parade = src->display == DISP_PARADE;
@@ -502,7 +610,7 @@ static void his_render_graticule(struct his_source *src)
 			for (int i = 0; i < n_parade; i++) {
 				const float ycoe = (float)(src->level_height * 1);
 				const float yoff = (float)(src->level_height * j);
-				const float xoff = parade ? HI_SIZE * i + 0.0f : 1.0f;
+				const float xoff = parade ? (float)(levels * i) : hlg ? 0.0f : 1.0f;
 				struct matrix4 tr = {
 					{.ptr = {1.0f, 0.0f, 0.0f, 0.0f}},
 					{.ptr = {0.0f, ycoe, 0.0f, 0.0f}},
@@ -511,9 +619,33 @@ static void his_render_graticule(struct his_source *src)
 				};
 				gs_matrix_push();
 				gs_matrix_mul(&tr);
-				gs_load_vertexbuffer(src->graticule_line_vbuf);
-				gs_draw(GS_LINES, parade && i ? 2 : 0, 0);
+				gs_load_vertexbuffer(vbuf);
+				gs_draw(GS_LINES, parade && i && !hlg ? 2 : 0, 0);
 				gs_matrix_pop();
+			}
+		}
+	}
+}
+
+static void his_render_graticule(struct his_source *src)
+{
+	const bool hlg = cur_hlg(src);
+	if (src->graticule_line_vbuf)
+		his_render_graticule_vbuf(src, src->graticule_line_vbuf, 0x80FFBF00 /* amber */, hlg);
+	if (src->graticule_ref_vbuf)
+		his_render_graticule_vbuf(src, src->graticule_ref_vbuf, 0xC040E0FF /* cyan */, hlg);
+
+	if (src->label_tex && (int)src->label_height < src->level_height) {
+		const bool stack = src->display == DISP_STACK;
+		const bool parade = src->display == DISP_PARADE;
+		const int n_parade = parade ? n_components(src) : 1;
+		const int n_stack = stack ? n_components(src) : 1;
+		const uint32_t levels = cur_levels(src);
+		for (int j = 0; j < n_stack; j++) {
+			for (int i = 0; i < n_parade; i++) {
+				const float x = (float)(levels * i);
+				const float y = (float)(src->level_height * (j + 1) - (int)src->label_height);
+				draw_texture_blended(src->label_tex, x, y);
 			}
 		}
 	}
@@ -525,7 +657,7 @@ static inline void render_histogram(struct his_source *src)
 	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), src->tex_hi);
 	gs_effect_set_vec3(gs_effect_get_param_by_name(effect, "hi_max"), &src->vec_hi_max);
 	const char *name = "Draw";
-	int w = HI_SIZE;
+	int w = src->tex_hi_levels;
 	int h = src->level_height;
 	int n = n_components(src);
 	if (src->effect)
@@ -562,16 +694,25 @@ static void his_render(void *data, gs_effect_t *effect)
 	PROFILE_START(prof_draw_name);
 	int r_tex_buf = src->w_tex_buf ^ 1;
 	if (src->tex_buf[r_tex_buf]) {
-		his_set_image(src, src->tex_buf[r_tex_buf], src->hi_max[r_tex_buf]);
+		his_set_image(src, src->tex_buf[r_tex_buf], src->hi_max[r_tex_buf],
+			      src->tex_buf_levels[r_tex_buf] ? src->tex_buf_levels[r_tex_buf] : HI_SIZE);
 		render_histogram(src);
 	}
 	PROFILE_END(prof_draw_name);
+
+	// HLG state and levels come from the analysed frame; rebuild when they change.
+	const uint32_t key =
+		cur_hlg(src) ? (1u | ((uint32_t)src->tex_buf_full_range[r_tex_buf] << 1) | (cur_levels(src) << 2)) : 0u;
+	if (key != src->graticule_key_prev) {
+		src->graticule_need_update = true;
+		src->graticule_key_prev = key;
+	}
 
 	if (src->graticule_need_update) {
 		create_graticule_vbuf(src);
 		src->graticule_need_update = false;
 	}
-	if (src->graticule_line_vbuf)
+	if (src->graticule_line_vbuf || src->graticule_ref_vbuf || src->label_tex)
 		his_render_graticule(src);
 
 	PROFILE_END(prof_render_name);
