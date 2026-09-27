@@ -1,0 +1,79 @@
+// HDR Lift: operates on OBS linear 709_EXTENDED values (1.0 = SDR white level).
+// Input from the filter texrender is premultiplied alpha.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float gain = 1.0;   // Gain mode: overall multiplier (includes trim)
+uniform float knee = 0.5;   // Knee mode: linear level below which nothing changes
+uniform float knee_a = 0.0; // Knee mode: quadratic coefficient, maps 1.0 to the target white
+uniform float trim = 1.0;   // Knee mode: final exposure trim
+
+sampler_state def_sampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertInOut {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertInOut VSDefault(VertInOut vert_in)
+{
+	VertInOut vert_out;
+	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = vert_in.uv;
+	return vert_out;
+}
+
+float4 PSGain(VertInOut vert_in) : TARGET
+{
+	float4 rgba = image.Sample(def_sampler, vert_in.uv);
+	rgba.rgb *= gain; // premultiplied: scaling rgb is exact
+	return rgba;
+}
+
+float knee_curve(float x)
+{
+	if (x <= knee)
+		return x;
+	float w = 1.0 - knee;
+	float t = (x - knee) / w;
+	if (t <= 1.0)
+		return knee + w * (t + knee_a * t * t);
+	// beyond input SDR white (HDR sources): continue with the end slope
+	return knee + w * (1.0 + knee_a) + (1.0 + 2.0 * knee_a) * (x - 1.0);
+}
+
+float4 PSKnee(VertInOut vert_in) : TARGET
+{
+	float4 rgba = image.Sample(def_sampler, vert_in.uv);
+	if (rgba.a <= 0.0)
+		return rgba;
+	float3 rgb = rgba.rgb / rgba.a;
+	float m = max(max(rgb.r, rgb.g), rgb.b);
+	// apply the curve to maxRGB and scale all channels by the same ratio (keeps hue)
+	float ratio = (m > 0.0) ? knee_curve(m) / m : 1.0;
+	rgb *= ratio * trim;
+	return float4(rgb * rgba.a, rgba.a);
+}
+
+technique Gain
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader  = PSGain(vert_in);
+	}
+}
+
+technique Knee
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader  = PSKnee(vert_in);
+	}
+}

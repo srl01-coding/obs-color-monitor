@@ -39,6 +39,7 @@ extern const struct obs_source_info colormonitor_falsecolor_filter;
 extern const struct obs_source_info colormonitor_focuspeaking;
 extern const struct obs_source_info colormonitor_focuspeaking_filter;
 extern const struct obs_source_info colormonitor_roi;
+extern const struct obs_source_info colormonitor_hdr_lift_filter;
 void scope_docks_init();
 
 static bool register_source_with_flags(const struct obs_source_info *const_info, uint32_t flags)
@@ -99,6 +100,8 @@ bool obs_module_load(void)
 	if (!register_source_with_flags(&colormonitor_focuspeaking_filter, flt_flags))
 		return false;
 	if (!register_source_with_flags(&colormonitor_roi, src_flags))
+		return false;
+	if (!register_source_with_flags(&colormonitor_hdr_lift_filter, flt_flags))
 		return false;
 
 	scope_docks_init();

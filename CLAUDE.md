@@ -49,6 +49,12 @@ ROI sources (`roi.c`) share `cm.texrender`, so they inherit whatever common.c do
   512; 1024). Properties `hdr_scale` (HLG % / 10-bit code) and `hdr_labels`;
   graticule marks + 5x7 bitmap labels (collision-avoiding) in `src/hdr-scale.c`.
   Cyan = reference lines (0%, 75% BT.2408 ref white, 100%; or 64/940).
+- `src/hdr-lift-filter.c` + `data/hdr-lift.effect`: "HDR Lift" filter, renders its input
+  in GS_RGBA16F / GS_CS_709_EXTENDED; modes Gain and Knee (quadratic, C1 at knee, maxRGB
+  ratio, premultiplied-alpha aware). Replaces Compose SDR on HDR (480-nit cap) and
+  obs-shaderfilter (observed clamping at SDR white on HDR sources in 2.6.0).
+- Verified in OBS with a 10-bit HLG test file: bars read correctly 0-100%; >940 is
+  clamped by OBS's own YUV_to_RGB (limited-range clamp) on input, not by the scope.
 - vectorscope: decodes 10-bit (>>2) so it doesn't show garbage; graticule still 601/709.
 - Known gaps: PQ canvas uses legacy SDR path; zebra/false colour/focus peaking
   bypass textures carry the HLG signal in HLG mode (untested); ROI display untested.
