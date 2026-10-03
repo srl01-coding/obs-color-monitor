@@ -498,6 +498,11 @@ static void render_waveform(struct wvs_source *src)
 	gs_effect_t *effect = src->effect ? src->effect : obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), src->tex_wv);
 	gs_effect_set_float(gs_effect_get_param_by_name(effect, "intensity"), (float)src->intensity);
+	struct vec2 image_size;
+	vec2_set(&image_size, (float)src->tex_wv_width, (float)src->tex_wv_levels);
+	gs_eparam_t *p_size = gs_effect_get_param_by_name(effect, "image_size");
+	if (p_size)
+		gs_effect_set_vec2(p_size, &image_size);
 	const char *name = "Draw";
 	int w = src->tex_wv_width;
 	int h = src->tex_wv_levels;

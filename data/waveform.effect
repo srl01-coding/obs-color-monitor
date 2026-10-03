@@ -1,6 +1,10 @@
 uniform float4x4 ViewProj;
 uniform texture2d image;
 uniform float intensity;
+// Texture size in texels (width, rows). Used to keep thin traces visible when
+// the scope is displayed smaller than its native size: every screen pixel
+// takes the maximum over all texel rows it covers instead of one sample.
+uniform float2 image_size = {256.0, 256.0};
 uniform float4x4 color = {
 	1.00, 0.41, 0.41, 0.0,
 	0.00, 1.00, 0.00, 0.0,
@@ -27,10 +31,42 @@ VertInOut VSDefault(VertInOut vert_in)
 	return vert_out;
 }
 
+// Exact texel fetch (no gradients, so it is legal inside a dynamic loop).
+// u, v may lie outside [0,1) by whole units (stack/parade panels): wrap them.
+float4 load_uv(float u, float v)
+{
+	float x = min(floor(frac(u) * image_size.x), image_size.x - 1.0);
+	float y = min(floor(frac(v) * image_size.y), image_size.y - 1.0);
+	return image.Load(int3(int(x), int(y), 0));
+}
+
+// Maximum over the texel rows covered by one screen pixel at (u, v), so a
+// one-row trace cannot disappear when the scope is drawn smaller than its
+// native size. dv = |d v / d screen-y| in texture coordinates.
+float4 sample_max_v(float u, float v, float dv)
+{
+	float rows = dv * image_size.y;
+	float4 m = load_uv(u, v);
+	if (rows > 1.0) {
+		float n = min(ceil(rows), 32.0);
+		float step = dv / n;
+		float vk = v - 0.5 * dv + 0.5 * step;
+		// stay inside the current panel
+		float v_lo = floor(v);
+		float k = 0.0;
+		do {
+			m = max(m, load_uv(u, clamp(vk, v_lo, v_lo + 0.99999)));
+			vk += step;
+			k += 1.0;
+		} while (k < n);
+	}
+	return m;
+}
+
 float4 PSDrawOverlay(VertInOut vert_in) : TARGET
 {
 	float4 rgb;
-	rgb.xyz = image.Sample(def_sampler, vert_in.uv).xyz * intensity;
+	rgb.xyz = sample_max_v(vert_in.uv.x, vert_in.uv.y, abs(ddy(vert_in.uv.y))).xyz * intensity;
 	if (rgb.x>1.0) rgb.x = 1.0;
 	if (rgb.y>1.0) rgb.y = 1.0;
 	if (rgb.z>1.0) rgb.z = 1.0;
@@ -42,7 +78,7 @@ float4 PSDrawStack(VertInOut vert_in) : TARGET
 {
 	int i = int(vert_in.uv.y * 3);
 	float v = vert_in.uv.y * 3 - i;
-	float r = image.Sample(def_sampler, float2(vert_in.uv.x, v))[i] * intensity;
+	float r = sample_max_v(vert_in.uv.x, v, abs(ddy(vert_in.uv.y)) * 3.0)[i] * intensity;
 	if (r>1.0) r = 1.0;
 	return float4(color[i].xyz*r, 1.0);
 }
@@ -51,7 +87,7 @@ float4 PSDrawParade(VertInOut vert_in) : TARGET
 {
 	int i = int(vert_in.uv.x * 3);
 	float u = vert_in.uv.x * 3 - i;
-	float r = image.Sample(def_sampler, float2(u, vert_in.uv.y))[i] * intensity;
+	float r = sample_max_v(u, vert_in.uv.y, abs(ddy(vert_in.uv.y)))[i] * intensity;
 	if (r>1.0) r = 1.0;
 	return float4(color[i].xyz*r, 1.0);
 }
@@ -64,7 +100,7 @@ float4 PSDrawStackUV(VertInOut vert_in) : TARGET
 	else
 		i = 2;
 	float v = vert_in.uv.y * 2;
-	float r = image.Sample(def_sampler, float2(vert_in.uv.x, v))[i] * intensity;
+	float r = sample_max_v(vert_in.uv.x, v, abs(ddy(vert_in.uv.y)) * 2.0)[i] * intensity;
 	if (r>1.0) r = 1.0;
 	return float4(color[i].xyz*r, 1.0);
 }
@@ -77,7 +113,7 @@ float4 PSDrawParadeUV(VertInOut vert_in) : TARGET
 	else
 		i = 2;
 	float u = vert_in.uv.x * 2;
-	float r = image.Sample(def_sampler, float2(u, vert_in.uv.y))[i] * intensity;
+	float r = sample_max_v(u, vert_in.uv.y, abs(ddy(vert_in.uv.y)))[i] * intensity;
 	if (r>1.0) r = 1.0;
 	return float4(color[i].xyz*r, 1.0);
 }

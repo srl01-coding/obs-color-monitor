@@ -661,6 +661,11 @@ static inline void render_histogram(struct his_source *src)
 	gs_effect_t *effect = src->effect ? src->effect : obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), src->tex_hi);
 	gs_effect_set_vec3(gs_effect_get_param_by_name(effect, "hi_max"), &src->vec_hi_max);
+	struct vec2 image_size;
+	vec2_set(&image_size, (float)src->tex_hi_levels, 1.0f);
+	gs_eparam_t *p_size = gs_effect_get_param_by_name(effect, "image_size");
+	if (p_size)
+		gs_effect_set_vec2(p_size, &image_size);
 	const char *name = "Draw";
 	int w = src->tex_hi_levels;
 	int h = src->level_height;

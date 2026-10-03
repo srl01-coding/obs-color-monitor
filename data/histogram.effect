@@ -1,6 +1,10 @@
 uniform float4x4 ViewProj;
 uniform texture2d image;
 uniform float3 hi_max;
+// Texture size in texels (bins, 1). See waveform.effect: when the histogram is
+// drawn narrower than its bin count, each screen column takes the maximum over
+// the bins it covers so single-bin spikes cannot disappear.
+uniform float2 image_size = {256.0, 1.0};
 uniform float4x4 color = {
 	1.00, 0.41, 0.41, 0.0,
 	0.00, 1.00, 0.00, 0.0,
@@ -27,10 +31,37 @@ VertInOut VSDefault(VertInOut vert_in)
 	return vert_out;
 }
 
+// Exact texel fetch of bin at coordinate u (wrapped for parade panels).
+float4 load_bin(float u)
+{
+	float x = min(floor(frac(u) * image_size.x), image_size.x - 1.0);
+	return image.Load(int3(int(x), 0, 0));
+}
+
+// Maximum over the bins covered by one screen column. du = |d u / d screen-x|.
+float4 sample_max_u(float u, float du)
+{
+	float bins = du * image_size.x;
+	float4 m = load_bin(u);
+	if (bins > 1.0) {
+		float n = min(ceil(bins), 32.0);
+		float step = du / n;
+		float uk = u - 0.5 * du + 0.5 * step;
+		float u_lo = floor(u);
+		float k = 0.0;
+		do {
+			m = max(m, load_bin(clamp(uk, u_lo, u_lo + 0.99999)));
+			uk += step;
+			k += 1.0;
+		} while (k < n);
+	}
+	return m;
+}
+
 float4 PSDrawOverlay(VertInOut vert_in) : TARGET
 {
 	float4 rgb;
-	rgb.xyz = image.Sample(def_sampler, float2(vert_in.uv.x, 0.5)).xyz;
+	rgb.xyz = sample_max_u(vert_in.uv.x, abs(ddx(vert_in.uv.x))).xyz;
 	if (rgb.x >= (1-vert_in.uv.y) * hi_max.x) rgb.x=1.0; else rgb.x=0.0;
 	if (rgb.y >= (1-vert_in.uv.y) * hi_max.y) rgb.y=1.0; else rgb.y=0.0;
 	if (rgb.z >= (1-vert_in.uv.y) * hi_max.z) rgb.z=1.0; else rgb.z=0.0;
@@ -42,7 +73,7 @@ float4 PSDrawStack(VertInOut vert_in) : TARGET
 {
 	int i = int(vert_in.uv.y * 3);
 	float v = vert_in.uv.y * 3 - i;
-	float r = image.Sample(def_sampler, float2(vert_in.uv.x, 0.5))[i];
+	float r = sample_max_u(vert_in.uv.x, abs(ddx(vert_in.uv.x)))[i];
 	if (r >= (1-v) * hi_max[i]) r=1.0; else r=0.0;
 	return float4(color[i].xyz*r, 1.0);
 }
@@ -50,7 +81,7 @@ float4 PSDrawStack(VertInOut vert_in) : TARGET
 float4 PSDrawParade(VertInOut vert_in) : TARGET
 {
 	int i = int(vert_in.uv.x * 3);
-	float r = image.Sample(def_sampler, float2(vert_in.uv.x*3, 0.5))[i];
+	float r = sample_max_u(vert_in.uv.x*3, abs(ddx(vert_in.uv.x))*3.0)[i];
 	if (r >= (1-vert_in.uv.y) * hi_max[i]) r=1.0; else r=0.0;
 	return float4(color[i].xyz*r, 1.0);
 }
@@ -67,7 +98,7 @@ float4 PSDrawStackUV(VertInOut vert_in) : TARGET
 		i = 2;
 		v = vert_in.uv.y * 2 - 1;
 	}
-	float r = image.Sample(def_sampler, float2(vert_in.uv.x, 0.5))[i];
+	float r = sample_max_u(vert_in.uv.x, abs(ddx(vert_in.uv.x)))[i];
 	if (r >= (1-v) * hi_max[i]) r=1.0; else r=0.0;
 	return float4(color[i].xyz*r, 1.0);
 }
@@ -79,7 +110,7 @@ float4 PSDrawParadeUV(VertInOut vert_in) : TARGET
 		i = 0;
 	else
 		i = 2;
-	float r = image.Sample(def_sampler, float2(vert_in.uv.x*2, 0.5))[i];
+	float r = sample_max_u(vert_in.uv.x*2, abs(ddx(vert_in.uv.x))*2.0)[i];
 	if (r >= (1-vert_in.uv.y) * hi_max[i]) r=1.0; else r=0.0;
 	return float4(color[i].xyz*r, 1.0);
 }
