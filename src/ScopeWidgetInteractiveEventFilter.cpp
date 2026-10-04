@@ -21,6 +21,11 @@ bool ScopeWidgetInteractiveEventFilter::eventFilter(QObject *, QEvent *event)
 	case QEvent::KeyRelease:
 		return parent->HandleKeyEvent(static_cast<QKeyEvent *>(event));
 
+	case QEvent::Resize:
+	case QEvent::Show:
+		parent->UpdateUiScale(); // e.g. dock moved to a screen with another scale
+		return false;
+
 	default:
 		return false;
 	}

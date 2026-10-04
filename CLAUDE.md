@@ -47,7 +47,11 @@ ROI sources (`roi.c`) share `cm.texrender`, so they inherit whatever common.c do
 - waveform/histogram: analysis is 10-bit; display resolution is a property
   (`hdr_rows` / `hdr_cols`: 256 default = same source size as SDR, 4 codes per step;
   512; 1024). Properties `hdr_scale` (HLG % / 10-bit code) and `hdr_labels`;
-  graticule marks + 5x7 bitmap labels (collision-avoiding) in `src/hdr-scale.c`.
+  graticule marks + label layout (collision-avoiding) in `src/hdr-scale.c`. Labels are
+  anti-aliased SDF text (`src/scope-text.c`, `data/scope-text.effect`, atlas
+  `src/scope-font-atlas.h` from `tools/gen-scope-font.py`, Roboto Condensed Medium, OFL in
+  `data/fonts/`). In the scope dock the source skips its labels (`cm_scope_labels_external`)
+  and the dock draws them in pixel space at a fixed size (`wvs/his_draw_overlay_labels`).
   Cyan = reference lines (0%, 75% BT.2408 ref white, 100%; or 64/940).
 - `src/hdr-lift-filter.c` + `data/hdr-lift.effect`: "HDR Lift" filter, renders its input
   in GS_RGBA16F / GS_CS_709_EXTENDED; modes Gain and Knee (quadratic, C1 at knee, maxRGB

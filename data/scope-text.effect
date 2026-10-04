@@ -1,0 +1,77 @@
+// Anti-aliased scope labels from a signed-distance-field font atlas
+// (src/scope-font-atlas.h, Roboto Condensed Medium, SIL OFL 1.1).
+// The atlas stores 0.5 at the glyph edge, rising inside. The edge is smoothed
+// over about one screen pixel whatever the scale, and a dark halo of halo_px
+// screen pixels keeps the text readable over traces.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float4 color;
+uniform float4 halo_color;
+uniform float halo_px = 1.5;
+uniform float spread_px = 6.0;
+uniform float2 atlas_size = {256.0, 96.0};
+
+sampler_state def_sampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertInOut {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertInOut VSDefault(VertInOut vert_in)
+{
+	VertInOut vert_out;
+	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = vert_in.uv;
+	return vert_out;
+}
+
+// change of the distance value per screen pixel
+float dist_per_px(float2 uv)
+{
+	float2 t = uv * atlas_size;
+	float texels = 0.5 * (length(ddx(t)) + length(ddy(t)));
+	return texels / (2.0 * spread_px);
+}
+
+float4 PSFill(VertInOut vert_in) : TARGET
+{
+	float d = image.Sample(def_sampler, vert_in.uv).r;
+	float g = dist_per_px(vert_in.uv);
+	float w = 0.7 * g;
+	float a = smoothstep(0.5 - w, 0.5 + w, d);
+	return float4(color.rgb, color.a * a);
+}
+
+float4 PSHalo(VertInOut vert_in) : TARGET
+{
+	float d = image.Sample(def_sampler, vert_in.uv).r;
+	float g = dist_per_px(vert_in.uv);
+	float w = 0.7 * g;
+	float e = 0.5 - halo_px * g;
+	float a = smoothstep(e - w, e + w, d);
+	return float4(halo_color.rgb, halo_color.a * a);
+}
+
+technique Fill
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader  = PSFill(vert_in);
+	}
+}
+
+technique Halo
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader  = PSHalo(vert_in);
+	}
+}

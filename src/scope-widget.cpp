@@ -13,6 +13,7 @@
 #include "scope-widget-properties.hpp"
 #include "scope-dock.hpp"
 #include "ScopeWidgetInteractiveEventFilter.hpp"
+#include "scope-text.h"
 
 #define N_SRC SCOPE_WIDGET_N_SRC
 
@@ -51,6 +52,9 @@ struct scope_widget_s
 
 	// copy of properties
 	bool focuspeaking_actual_size;
+
+	// device pixel ratio of the widget, for the label overlay (written by the UI thread)
+	volatile float ui_scale;
 };
 
 static void generate_source_name(std::string &result, const char *id)
@@ -152,7 +156,20 @@ static void draw(void *param, uint32_t cx, uint32_t cy)
 			r.w = w_src;
 			r.h = h_src;
 
+			// Waveform / histogram: the source skips its own labels and they are drawn
+			// here in pixel space, so they keep a fixed, legible size however the
+			// scope is stretched to fit the dock.
+			const bool overlay = i == 2 || i == 3;
+			cm_scope_labels_external = overlay;
 			obs_source_video_render(s);
+			cm_scope_labels_external = false;
+			if (overlay) {
+				gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
+				if (i == 2)
+					wvs_draw_overlay_labels(s, w, h, data->ui_scale);
+				else
+					his_draw_overlay_labels(s, w, h, data->ui_scale);
+			}
 
 			gs_viewport_pop();
 			gs_projection_pop();
@@ -192,6 +209,7 @@ ScopeWidget::ScopeWidget(QWidget *parent) : NorisQTDisplay(parent)
 	data->src_shown = (1 << N_SRC) - 1;
 	data->i_mouse_last = -1;
 	data->i_src_menu = -1;
+	data->ui_scale = (float)devicePixelRatioF();
 
 	connect(this, &NorisQTDisplay::DisplayCreated, this, &ScopeWidget::RegisterCallbackToDisplay);
 }
@@ -220,8 +238,15 @@ ScopeWidget::~ScopeWidget()
 	data = NULL;
 }
 
+void ScopeWidget::UpdateUiScale()
+{
+	if (data)
+		data->ui_scale = (float)devicePixelRatioF();
+}
+
 void ScopeWidget::RegisterCallbackToDisplay()
 {
+	UpdateUiScale();
 	obs_display_t *display = GetDisplay();
 	obs_display_add_draw_callback(display, draw, data);
 }

@@ -20,6 +20,7 @@ public:
 private:
 	void closeEvent(QCloseEvent *event) override;
 	void RegisterCallbackToDisplay();
+	void UpdateUiScale();
 
 	// for interactions
 	bool HandleMouseClickEvent(QMouseEvent *event);

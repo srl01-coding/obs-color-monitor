@@ -22,6 +22,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-frontend-api.h>
 
 #include "plugin-macros.generated.h"
+#include "scope-text.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
@@ -108,4 +109,11 @@ bool obs_module_load(void)
 	blog(LOG_INFO, "plugin loaded (plugin version %s, API version %d.%d.%d)", PLUGIN_VERSION, LIBOBS_API_MAJOR_VER,
 	     LIBOBS_API_MINOR_VER, LIBOBS_API_PATCH_VER);
 	return true;
+}
+
+void obs_module_unload(void)
+{
+	obs_enter_graphics();
+	scope_text_free();
+	obs_leave_graphics();
 }

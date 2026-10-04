@@ -47,15 +47,27 @@ static inline uint32_t hdr_rows_shift(uint32_t rows)
 	return rows >= 1024 ? 0 : rows >= 512 ? 1 : 2;
 }
 
-// RGBA label images (row 0 = top) for overlaying on scopes. Caller frees with bfree.
-// `levels` is the axis length in pixels; 10-bit codes are mapped onto it (1024 codes -> levels px).
-// Labels that would collide are dropped, reference labels have priority.
-// Vertical: height `levels`, text placed just above each mark (code increases upward).
-uint8_t *hdr_scale_label_image_vertical(const struct hdr_scale_mark *marks, int n, uint32_t levels,
-					uint32_t glyph_scale, uint32_t *width);
-// Horizontal: width `levels`, text centred on each mark (code increases rightward).
-uint8_t *hdr_scale_label_image_horizontal(const struct hdr_scale_mark *marks, int n, uint32_t levels,
-					  uint32_t glyph_scale, uint32_t *height);
+// Label placement for drawing with scope_text (any drawing units, y grows downward).
+struct hdr_scale_label
+{
+	float x, y; // anchor: x as per `align`, y = text baseline
+	int align;  // SCOPE_TEXT_LEFT / CENTER / RIGHT
+	bool ref;
+	char text[8];
+};
+
+// Vertical axis (waveform): line_y[i] is the drawn position of marks[i]. Text is
+// left-aligned at x with its baseline `gap` above the line, or below the line when
+// there is no room above `top`. Labels that would collide are dropped, reference
+// labels first. Returns the number of labels written to out (<= n).
+int hdr_scale_layout_vertical(const struct hdr_scale_mark *marks, const float *line_y, int n, float x, float size,
+			      float gap, float top, struct hdr_scale_label *out);
+
+// Horizontal axis (histogram): text centred on line_x[i] with its baseline at y,
+// kept within [left, right]; `measure` returns the width of a text at `size`.
+int hdr_scale_layout_horizontal(const struct hdr_scale_mark *marks, const float *line_x, int n, float y, float size,
+				float left, float right, float (*measure)(const char *, float),
+				struct hdr_scale_label *out);
 
 #ifdef __cplusplus
 }

@@ -5,6 +5,8 @@
 #include "common.h"
 #include "util.h"
 #include "hdr-scale.h"
+#include "scope-text.h"
+#include <string.h>
 
 #ifdef ENABLE_PROFILE
 #define PROFILE_START(x) profile_start(x)
@@ -46,9 +48,9 @@ struct wvs_source
 	int r_tex_buf;
 
 	gs_vertbuffer_t *graticule_line_vbuf;
-	gs_vertbuffer_t *graticule_ref_vbuf; // HLG: black, nominal peak, reference white
-	gs_texture_t *label_tex;
-	uint32_t label_width;
+	gs_vertbuffer_t *graticule_ref_vbuf;              // HLG: black, nominal peak, reference white
+	struct hdr_scale_mark marks[HDR_SCALE_MAX_MARKS]; // HLG scale, for the labels
+	int n_marks;
 
 	int display;
 	uint32_t components;
@@ -104,7 +106,6 @@ static void wvs_destroy(void *data)
 	gs_texture_destroy(src->tex_wv);
 	gs_vertexbuffer_destroy(src->graticule_line_vbuf);
 	gs_vertexbuffer_destroy(src->graticule_ref_vbuf);
-	gs_texture_destroy(src->label_tex);
 	obs_leave_graphics();
 
 	cm_destroy(&src->cm);
@@ -391,14 +392,8 @@ static void create_graticule_hlg(struct wvs_source *src)
 			src->graticule_line_vbuf = gs_render_save();
 	}
 
-	if (src->hdr_labels && n > 0) {
-		uint32_t w = 0;
-		uint8_t *img = hdr_scale_label_image_vertical(marks, n, levels, levels / 256, &w);
-		const uint8_t *data = img;
-		src->label_tex = gs_texture_create(w, levels, GS_RGBA, 1, &data, 0);
-		src->label_width = w;
-		bfree(img);
-	}
+	memcpy(src->marks, marks, sizeof(marks));
+	src->n_marks = n;
 }
 
 static void create_graticule_vbuf(struct wvs_source *src)
@@ -408,8 +403,7 @@ static void create_graticule_vbuf(struct wvs_source *src)
 	src->graticule_line_vbuf = NULL;
 	gs_vertexbuffer_destroy(src->graticule_ref_vbuf);
 	src->graticule_ref_vbuf = NULL;
-	gs_texture_destroy(src->label_tex);
-	src->label_tex = NULL;
+	src->n_marks = 0;
 	if (cur_hlg(src)) {
 		create_graticule_hlg(src);
 	} else if (src->graticule_lines > 0) {
@@ -421,6 +415,32 @@ static void create_graticule_vbuf(struct wvs_source *src)
 		src->graticule_line_vbuf = gs_render_save();
 	}
 	obs_leave_graphics();
+}
+
+#define LABEL_COLOR 0xF0FFBF00     // amber, as the graticule
+#define LABEL_REF_COLOR 0xFF40E0FF // cyan, as the reference lines
+
+// Draw the HLG scale labels. Drawing units: y_draw = (y_source + oy) * sy, x from the left edge.
+static void wvs_draw_labels(struct wvs_source *src, float sy, float oy, float size, float margin, float gap)
+{
+	if (!src->hdr_labels || src->n_marks <= 0)
+		return;
+	const uint32_t levels = cur_levels(src);
+	const int n_stack = src->display == DISP_STACK ? (int)n_components(src) : 1;
+	float line_y[HDR_SCALE_MAX_MARKS];
+	struct hdr_scale_label labels[HDR_SCALE_MAX_MARKS];
+	for (int p = 0; p < n_stack; p++) {
+		const float panel_top = ((float)(levels * p) + oy) * sy;
+		for (int i = 0; i < src->n_marks; i++)
+			line_y[i] =
+				((float)(levels * (p + 1)) - hdr_scale_code_to_px(src->marks[i].code, levels) + oy) *
+				sy;
+		const int n = hdr_scale_layout_vertical(src->marks, line_y, src->n_marks, margin, size, gap, panel_top,
+							labels);
+		for (int i = 0; i < n; i++)
+			scope_text_draw(labels[i].text, labels[i].x, labels[i].y, size,
+					labels[i].ref ? LABEL_REF_COLOR : LABEL_COLOR, SCOPE_TEXT_LEFT);
+	}
 }
 
 static void wvs_render_graticule_hlg(struct wvs_source *src)
@@ -455,10 +475,29 @@ static void wvs_render_graticule_hlg(struct wvs_source *src)
 		}
 	}
 
-	if (src->label_tex) {
-		for (int i = 0; i < n_stack; i++)
-			draw_texture_blended(src->label_tex, 0.0f, (float)(levels * i));
+	// Labels in source units, sized for a scope shown near its native size. The
+	// scope dock draws them itself at a fixed on-screen size instead.
+	if (!cm_scope_labels_external) {
+		const float k = (float)levels / 256.0f;
+		wvs_draw_labels(src, 1.0f, 0.0f, 8.0f * k, 3.0f * k, 2.0f * k);
 	}
+}
+
+void wvs_draw_overlay_labels(void *source, int w, int h, float ui_scale)
+{
+	obs_source_t *s = source;
+	const char *id = s ? obs_source_get_unversioned_id(s) : NULL;
+	if (!id || strcmp(id, "waveform_source") != 0 || w <= 0 || h <= 0)
+		return;
+	struct wvs_source *src = obs_obj_get_data(s);
+	if (!src || src->cm.bypass || !cur_hlg(src) || src->graticule_lines <= 0)
+		return;
+	const uint32_t h_src = wvs_get_height(src);
+	if (!h_src)
+		return;
+	const float k = ui_scale > 0.0f ? ui_scale : 1.0f;
+	// the dock maps source y in [-1, h_src] onto [0, h] pixels
+	wvs_draw_labels(src, (float)h / (float)(h_src + 1), 1.0f, 10.0f * k, 5.0f * k, 3.0f * k);
 }
 
 static void wvs_render_graticule(struct wvs_source *src)

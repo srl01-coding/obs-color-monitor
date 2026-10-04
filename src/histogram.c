@@ -5,6 +5,8 @@
 #include "common.h"
 #include "util.h"
 #include "hdr-scale.h"
+#include "scope-text.h"
+#include <string.h>
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -53,9 +55,9 @@ struct his_source
 	volatile int w_tex_buf;
 
 	gs_vertbuffer_t *graticule_line_vbuf;
-	gs_vertbuffer_t *graticule_ref_vbuf; // HLG: black, nominal peak, reference white
-	gs_texture_t *label_tex;
-	uint32_t label_height;
+	gs_vertbuffer_t *graticule_ref_vbuf;              // HLG: black, nominal peak, reference white
+	struct hdr_scale_mark marks[HDR_SCALE_MAX_MARKS]; // HLG scale, for the labels
+	int n_marks;
 	int hdr_scale;
 	bool hdr_labels;
 	uint32_t hdr_cols; // HLG: 256, 512 or 1024 bins; 10-bit codes are binned 4, 2 or 1 per bin
@@ -115,7 +117,6 @@ static void his_destroy(void *data)
 	gs_texture_destroy(src->tex_hi);
 	gs_vertexbuffer_destroy(src->graticule_line_vbuf);
 	gs_vertexbuffer_destroy(src->graticule_ref_vbuf);
-	gs_texture_destroy(src->label_tex);
 	obs_leave_graphics();
 
 	cm_destroy(&src->cm);
@@ -533,8 +534,7 @@ static void create_graticule_vbuf(struct his_source *src)
 	src->graticule_line_vbuf = NULL;
 	gs_vertexbuffer_destroy(src->graticule_ref_vbuf);
 	src->graticule_ref_vbuf = NULL;
-	gs_texture_destroy(src->label_tex);
-	src->label_tex = NULL;
+	src->n_marks = 0;
 
 	const bool hlg = cur_hlg(src);
 	const uint32_t levels = cur_levels(src);
@@ -561,14 +561,8 @@ static void create_graticule_vbuf(struct his_source *src)
 			src->graticule_ref_vbuf = gs_render_save();
 		}
 
-		if (src->hdr_labels && n_marks > 0) {
-			uint32_t h = 0;
-			uint8_t *img = hdr_scale_label_image_horizontal(marks, n_marks, levels, levels / 256, &h);
-			const uint8_t *data = img;
-			src->label_tex = gs_texture_create(levels, h, GS_RGBA, 1, &data, 0);
-			src->label_height = h;
-			bfree(img);
-		}
+		memcpy(src->marks, marks, sizeof(marks));
+		src->n_marks = n_marks;
 	}
 
 	if (!has_graticule_vertical && !has_graticule_horizontal)
@@ -632,6 +626,40 @@ static void his_render_graticule_vbuf(struct his_source *src, gs_vertbuffer_t *v
 	}
 }
 
+#define LABEL_COLOR 0xF0FFBF00     // amber, as the graticule
+#define LABEL_REF_COLOR 0xFF40E0FF // cyan, as the reference lines
+
+// Draw the HLG scale labels at the bottom of each panel. Drawing units:
+// x_draw = x_source * sx, y_draw = (y_source + oy) * sy.
+static void his_draw_labels(struct his_source *src, float sx, float sy, float oy, float size, float margin)
+{
+	if (!src->hdr_labels || src->n_marks <= 0)
+		return;
+	const bool stack = src->display == DISP_STACK;
+	const bool parade = src->display == DISP_PARADE;
+	const int n_parade = parade ? (int)n_components(src) : 1;
+	const int n_stack = stack ? (int)n_components(src) : 1;
+	const uint32_t levels = cur_levels(src);
+	if ((float)src->level_height * sy < 3.0f * size)
+		return; // panel too short for labels
+	float line_x[HDR_SCALE_MAX_MARKS];
+	struct hdr_scale_label labels[HDR_SCALE_MAX_MARKS];
+	for (int j = 0; j < n_stack; j++) {
+		const float baseline = ((float)(src->level_height * (j + 1)) + oy) * sy - margin;
+		for (int i = 0; i < n_parade; i++) {
+			const float x0 = (float)(levels * i);
+			for (int m = 0; m < src->n_marks; m++)
+				line_x[m] = (x0 + hdr_scale_code_to_px(src->marks[m].code, levels)) * sx;
+			const int n = hdr_scale_layout_horizontal(src->marks, line_x, src->n_marks, baseline, size,
+								  x0 * sx + margin, (x0 + (float)levels) * sx - margin,
+								  scope_text_width, labels);
+			for (int l = 0; l < n; l++)
+				scope_text_draw(labels[l].text, labels[l].x, labels[l].y, size,
+						labels[l].ref ? LABEL_REF_COLOR : LABEL_COLOR, SCOPE_TEXT_LEFT);
+		}
+	}
+}
+
 static void his_render_graticule(struct his_source *src)
 {
 	const bool hlg = cur_hlg(src);
@@ -640,20 +668,29 @@ static void his_render_graticule(struct his_source *src)
 	if (src->graticule_ref_vbuf)
 		his_render_graticule_vbuf(src, src->graticule_ref_vbuf, 0xC040E0FF /* cyan */, hlg);
 
-	if (src->label_tex && (int)src->label_height < src->level_height) {
-		const bool stack = src->display == DISP_STACK;
-		const bool parade = src->display == DISP_PARADE;
-		const int n_parade = parade ? n_components(src) : 1;
-		const int n_stack = stack ? n_components(src) : 1;
-		const uint32_t levels = cur_levels(src);
-		for (int j = 0; j < n_stack; j++) {
-			for (int i = 0; i < n_parade; i++) {
-				const float x = (float)(levels * i);
-				const float y = (float)(src->level_height * (j + 1) - (int)src->label_height);
-				draw_texture_blended(src->label_tex, x, y);
-			}
-		}
+	// Labels in source units, sized for a scope shown near its native size. The
+	// scope dock draws them itself at a fixed on-screen size instead.
+	if (hlg && !cm_scope_labels_external) {
+		const float k = (float)cur_levels(src) / 256.0f;
+		his_draw_labels(src, 1.0f, 1.0f, 0.0f, 8.0f * k, 3.0f * k);
 	}
+}
+
+void his_draw_overlay_labels(void *source, int w, int h, float ui_scale)
+{
+	obs_source_t *s = source;
+	const char *id = s ? obs_source_get_unversioned_id(s) : NULL;
+	if (!id || strcmp(id, "histogram_source") != 0 || w <= 0 || h <= 0)
+		return;
+	struct his_source *src = obs_obj_get_data(s);
+	if (!src || src->cm.bypass || !cur_hlg(src))
+		return;
+	const uint32_t w_src = his_get_width(src), h_src = his_get_height(src);
+	if (!w_src || !h_src)
+		return;
+	const float k = ui_scale > 0.0f ? ui_scale : 1.0f;
+	// the dock maps source x in [0, w_src] onto [0, w] and y in [-1, h_src] onto [0, h]
+	his_draw_labels(src, (float)w / (float)w_src, (float)h / (float)(h_src + 1), 1.0f, 10.0f * k, 5.0f * k);
 }
 
 static inline void render_histogram(struct his_source *src)
@@ -722,7 +759,7 @@ static void his_render(void *data, gs_effect_t *effect)
 		create_graticule_vbuf(src);
 		src->graticule_need_update = false;
 	}
-	if (src->graticule_line_vbuf || src->graticule_ref_vbuf || src->label_tex)
+	if (src->graticule_line_vbuf || src->graticule_ref_vbuf || src->n_marks > 0)
 		his_render_graticule(src);
 
 	PROFILE_END(prof_render_name);
