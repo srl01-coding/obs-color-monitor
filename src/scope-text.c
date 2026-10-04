@@ -71,7 +71,7 @@ float scope_text_width(const char *text, float size)
 static void emit_quads(const char *text, float pen, float baseline_y, float em)
 {
 	const float units_per_texel = em / SCOPE_FONT_EM_PX;
-	gs_render_start(true);
+	gs_render_start(false); // immediate mode: at most 6 vertices per glyph, well below 512
 	for (const char *c = text; *c; c++) {
 		const struct scope_font_glyph *g = find_glyph(*c);
 		if (!g) {
@@ -106,6 +106,22 @@ static void emit_quads(const char *text, float pen, float baseline_y, float em)
 	gs_render_stop(GS_TRIS);
 }
 
+static void set_params(uint32_t argb)
+{
+	struct vec4 color, halo;
+	vec4_from_bgra(&color, argb);
+	vec4_from_bgra(&halo, 0xD0000000);
+	struct vec2 atlas_size;
+	vec2_set(&atlas_size, (float)SCOPE_FONT_ATLAS_W, (float)SCOPE_FONT_ATLAS_H);
+
+	gs_effect_set_texture(gs_effect_get_param_by_name(text_effect, "image"), text_atlas);
+	gs_effect_set_vec4(gs_effect_get_param_by_name(text_effect, "color"), &color);
+	gs_effect_set_vec4(gs_effect_get_param_by_name(text_effect, "halo_color"), &halo);
+	gs_effect_set_float(gs_effect_get_param_by_name(text_effect, "halo_px"), 1.5f);
+	gs_effect_set_float(gs_effect_get_param_by_name(text_effect, "spread_px"), SCOPE_FONT_SPREAD_PX);
+	gs_effect_set_vec2(gs_effect_get_param_by_name(text_effect, "atlas_size"), &atlas_size);
+}
+
 void scope_text_draw(const char *text, float x, float baseline_y, float size, uint32_t argb, int align)
 {
 	if (!text || !*text || !(size > 0.0f))
@@ -120,25 +136,15 @@ void scope_text_draw(const char *text, float x, float baseline_y, float size, ui
 	else if (align == SCOPE_TEXT_RIGHT)
 		pen -= scope_text_width(text, size);
 
-	struct vec4 color, halo;
-	vec4_from_bgra(&color, argb);
-	vec4_from_bgra(&halo, 0xD0000000);
-	struct vec2 atlas_size;
-	vec2_set(&atlas_size, (float)SCOPE_FONT_ATLAS_W, (float)SCOPE_FONT_ATLAS_H);
-
-	gs_effect_set_texture(gs_effect_get_param_by_name(text_effect, "image"), text_atlas);
-	gs_effect_set_vec4(gs_effect_get_param_by_name(text_effect, "color"), &color);
-	gs_effect_set_vec4(gs_effect_get_param_by_name(text_effect, "halo_color"), &halo);
-	gs_effect_set_float(gs_effect_get_param_by_name(text_effect, "halo_px"), 1.5f);
-	gs_effect_set_float(gs_effect_get_param_by_name(text_effect, "spread_px"), SCOPE_FONT_SPREAD_PX);
-	gs_effect_set_vec2(gs_effect_get_param_by_name(text_effect, "atlas_size"), &atlas_size);
-
 	gs_blend_state_push();
 	gs_enable_blending(true);
 	gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 	// Halos of all glyphs first, so a neighbour's halo never darkens a glyph's fill.
+	// gs_technique_end() resets every effect parameter, so set them for each technique.
+	set_params(argb);
 	while (gs_effect_loop(text_effect, "Halo"))
 		emit_quads(text, pen, baseline_y, em);
+	set_params(argb);
 	while (gs_effect_loop(text_effect, "Fill"))
 		emit_quads(text, pen, baseline_y, em);
 	gs_blend_state_pop();
