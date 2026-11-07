@@ -117,3 +117,4 @@ void obs_module_unload(void)
 	scope_text_free();
 	obs_leave_graphics();
 }
+/* CI control build (throwaway branch hdr-ci-check) */
