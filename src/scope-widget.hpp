@@ -1,6 +1,7 @@
 #pragma once
 
 #include <obs.h>
+#include <QSize>
 #include <QWidget>
 #include <memory>
 #include <string>
@@ -35,6 +36,10 @@ public slots:
 
 public:
 	ScopeWidget(QWidget *parent);
+	// The display widget has no natural size, so without these Qt gives the dock its
+	// minimum when another dock in the same column is added or resized at startup.
+	QSize sizeHint() const override { return QSize(480, 320); }
+	QSize minimumSizeHint() const override { return QSize(160, 120); }
 	~ScopeWidget();
 	static void default_properties(obs_data_t *);
 	void save_properties(obs_data_t *);
