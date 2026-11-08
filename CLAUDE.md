@@ -60,8 +60,12 @@ ROI sources (`roi.c`) share `cm.texrender`, so they inherit whatever common.c do
 - Verified in OBS with a 10-bit HLG test file: bars read correctly 0-100%; >940 is
   clamped by OBS's own YUV_to_RGB (limited-range clamp) on input, not by the scope.
 - vectorscope: decodes 10-bit (>>2) so it doesn't show garbage; graticule still 601/709.
-- Known gaps: PQ canvas uses legacy SDR path; zebra/false colour/focus peaking
-  bypass textures carry the HLG signal in HLG mode (untested); ROI display untested.
+- HLG false colour / zebra (8 Nov, user): sources only (filters stay SDR). zebra.c picks
+  DrawFalseColorHLG / DrawZebraHLG when `cm.hlg`; uniforms hlg_y_scale/offset undo the code
+  mapping; BT.2020 luma; bands per BT.2408 Tables 1-2 (doc/falsecolor.md). Key drawn with
+  scale 1/offset 0, labels unchanged (0-100%). Zebra upper threshold max 110. NOT RUN in OBS.
+- Known gaps: PQ canvas uses legacy SDR path; focus peaking bypass texture carries the HLG
+  signal in HLG mode (untested); false colour/zebra filters are SDR-only; ROI display untested.
 
 ## Build / test
 - No local toolchain. CI (`.github/workflows/main.yml`, "Plugin Build") runs on

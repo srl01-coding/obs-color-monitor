@@ -240,7 +240,7 @@ static void zb_get_properties(obs_properties_t *props, bool is_falsecolor)
 		/* zebra */
 		prop = obs_properties_add_int(props, "zebra_th_low", obs_module_text("Threshold (lower)"), 50, 100, 1);
 		obs_property_int_set_suffix(prop, "%");
-		prop = obs_properties_add_int(props, "zebra_th_high", obs_module_text("Threshold (high)"), 50, 100, 1);
+		prop = obs_properties_add_int(props, "zebra_th_high", obs_module_text("Threshold (high)"), 50, 110, 1);
 		obs_property_int_set_suffix(prop, "%");
 	} else {
 		/* falsecolor */
@@ -362,6 +362,12 @@ static const char *draw_name(int colorspace, bool is_falsecolor)
 		return "DrawFalseColor709";
 	else
 		return "DrawZebra709";
+}
+
+static void set_hlg_range(gs_effect_t *e, float scale, float offset)
+{
+	gs_effect_set_float(gs_effect_get_param_by_name(e, "hlg_y_scale"), scale);
+	gs_effect_set_float(gs_effect_get_param_by_name(e, "hlg_y_offset"), offset);
 }
 
 static void set_effect_params(struct zb_source *src)
@@ -526,6 +532,7 @@ static void zb_render_key(struct zb_source *src, const char *draw, uint32_t widt
 		return;
 	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), src->key_tex);
 	set_effect_params(src);
+	set_hlg_range(effect, 1.0f, 0.0f); // HLG key: the gradient is the signal level 0..100%
 
 	gs_matrix_push();
 	struct matrix4 tran;
@@ -617,7 +624,18 @@ static void zbs_render(void *data, gs_effect_t *effect)
 
 		gs_effect_set_texture(gs_effect_get_param_by_name(e, "image"), tex);
 		set_effect_params(&src->zb);
-		const char *draw = draw_name(src->cm.colorspace, src->zb.is_falsecolor);
+		const char *draw;
+		if (src->cm.hlg) {
+			/* HLG canvas: the texture holds HLG R'G'B' code values (common.effect
+			 * ConvertRGB_HLG); bands and thresholds are HLG signal levels. */
+			draw = src->zb.is_falsecolor ? "DrawFalseColorHLG" : "DrawZebraHLG";
+			if (src->cm.full_range)
+				set_hlg_range(e, 1.0f, 0.0f);
+			else
+				set_hlg_range(e, 876.0f / 1023.0f, 64.0f / 1023.0f);
+		} else {
+			draw = draw_name(src->cm.colorspace, src->zb.is_falsecolor);
+		}
 		while (gs_effect_loop(e, draw))
 			gs_draw_sprite_subregion(tex, 0, 0, 0, cx, cy);
 
