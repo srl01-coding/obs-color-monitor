@@ -2,7 +2,6 @@
 #include <util/platform.h>
 #include <util/dstr.h>
 #include <graphics/matrix4.h>
-#include <graphics/image-file.h>
 #include "plugin-macros.generated.h"
 #include "obs-convenience.h"
 #include "common.h"
@@ -40,9 +39,10 @@ struct zb_source
 
 	/* internal data */
 	gs_texture_t *key_tex;
-	gs_image_file_t key_label_img;
+	gs_texture_t *key_label_tex; // falsecolor-key.png
+	bool key_label_tried;
 	gs_vertbuffer_t *key_label_vbuf;
-	gs_image_file_t falsecolor_lut;
+	gs_texture_t *falsecolor_lut_tex;
 	bool is_falsecolor;
 };
 
@@ -135,11 +135,12 @@ static void *fcf_create(obs_data_t *settings, obs_source_t *source)
 
 static void falsecolor_lut_unload(struct zb_source *src)
 {
-	if (!src->falsecolor_lut.loaded)
+	if (!src->falsecolor_lut_tex)
 		return;
 	obs_enter_graphics();
-	gs_image_file_free(&src->falsecolor_lut);
+	gs_texture_destroy(src->falsecolor_lut_tex);
 	obs_leave_graphics();
+	src->falsecolor_lut_tex = NULL;
 }
 
 static void zb_destroy(struct zb_source *src)
@@ -147,7 +148,7 @@ static void zb_destroy(struct zb_source *src)
 	if (src->key_tex) {
 		obs_enter_graphics();
 		gs_texture_destroy(src->key_tex);
-		gs_image_file_free(&src->key_label_img);
+		gs_texture_destroy(src->key_label_tex);
 		gs_vertexbuffer_destroy(src->key_label_vbuf);
 		obs_leave_graphics();
 	}
@@ -179,11 +180,11 @@ static void falsecolor_lut_load(struct zb_source *src, const char *lut_filename)
 	falsecolor_lut_unload(src);
 
 	blog(LOG_INFO, "Loading LUT file '%s'...", lut_filename);
-	gs_image_file_init(&src->falsecolor_lut, lut_filename);
-
 	obs_enter_graphics();
-	gs_image_file_init_texture(&src->falsecolor_lut);
+	src->falsecolor_lut_tex = gs_texture_create_from_file(lut_filename);
 	obs_leave_graphics();
+	if (!src->falsecolor_lut_tex)
+		blog(LOG_ERROR, "Cannot load LUT file '%s'", lut_filename);
 }
 
 static void zb_update(struct zb_source *src, obs_data_t *settings)
@@ -381,7 +382,7 @@ static void set_effect_params(struct zb_source *src)
 		gs_effect_set_float(gs_effect_get_param_by_name(e, "zebra_tm"), src->zebra_tm);
 	} else {
 		/* falsecolor */
-		gs_texture_t *lut = src->falsecolor_lut.texture;
+		gs_texture_t *lut = src->falsecolor_lut_tex;
 		gs_effect_set_bool(gs_effect_get_param_by_name(e, "use_lut"), !!lut);
 		if (lut)
 			gs_effect_set_texture(gs_effect_get_param_by_name(e, "lut"), lut);
@@ -403,12 +404,13 @@ static void zb_create_key_tex(struct zb_source *src)
 	bfree(buf);
 #undef N
 
-	if (!src->key_label_img.loaded) {
+	if (!src->key_label_tex && !src->key_label_tried) {
+		/* gs_texture_create_from_file: gs_image_file_* was removed in OBS 33 */
+		src->key_label_tried = true;
 		char *f = obs_module_file("falsecolor-key.png");
-		gs_image_file_init(&src->key_label_img, f);
-		if (!src->key_label_img.loaded)
+		src->key_label_tex = f ? gs_texture_create_from_file(f) : NULL;
+		if (!src->key_label_tex)
 			blog(LOG_ERROR, "Cannot load falsecolor-key.png (%s)", f);
-		gs_image_file_init_texture(&src->key_label_img);
 		bfree(f);
 	}
 }
@@ -553,7 +555,7 @@ static void zb_render_key(struct zb_source *src, const char *draw, uint32_t widt
 
 	gs_matrix_pop();
 
-	if (!src->key_label_img.loaded)
+	if (!src->key_label_tex)
 		return;
 
 	effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
@@ -569,15 +571,15 @@ static void zb_render_key(struct zb_source *src, const char *draw, uint32_t widt
 			y = height * (def->yk + def->cyk * 256 * i / 10);
 			w = width * (def->xk - def->x0);
 			h = height * fabsf(def->cyk * 256) / 10;
-			img_cx = src->key_label_img.cx * 55; // cx
-			img_cy = src->key_label_img.cy * 2;  // cy * 2 / 55
+			img_cx = (int)gs_texture_get_width(src->key_label_tex) * 55; // cx
+			img_cy = (int)gs_texture_get_height(src->key_label_tex) * 2; // cy * 2 / 55
 		} else {
 			x = width * (def->xk + def->cxk * 256 * i / 10);
 			y = height * def->yk;
 			w = width * def->cxk * 256 / 11;
 			h = height * (def->y1 - def->yk);
-			img_cx = src->key_label_img.cx * 55; // cx
-			img_cy = src->key_label_img.cy * 3;  // cy * 3 / 55
+			img_cx = (int)gs_texture_get_width(src->key_label_tex) * 55; // cx
+			img_cy = (int)gs_texture_get_height(src->key_label_tex) * 3; // cy * 3 / 55
 		}
 		// if w / h > cx / cy
 		if (w * img_cy > h * img_cx) {
@@ -600,7 +602,7 @@ static void zb_render_key(struct zb_source *src, const char *draw, uint32_t widt
 		}
 	}
 
-	draw_uv_vbuffer(src->key_label_vbuf, src->key_label_img.texture, effect, "Draw", 11 * 6);
+	draw_uv_vbuffer(src->key_label_vbuf, src->key_label_tex, effect, "Draw", 11 * 6);
 }
 
 static void zbs_render(void *data, gs_effect_t *effect)

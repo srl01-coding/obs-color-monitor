@@ -64,6 +64,12 @@ ROI sources (`roi.c`) share `cm.texrender`, so they inherit whatever common.c do
   DrawFalseColorHLG / DrawZebraHLG when `cm.hlg`; uniforms hlg_y_scale/offset undo the code
   mapping; BT.2020 luma; bands per BT.2408 Tables 1-2 (doc/falsecolor.md). Key drawn with
   scale 1/offset 0, labels unchanged (0-100%). Zebra upper threshold max 110. NOT RUN in OBS.
+- OBS 33 (8 Nov): libobs 33 removed gs_image_file_init/free/init_texture (replaced by
+  gs_image_file_ex_*), so a build importing them cannot load in OBS 33. zebra.c / vectorscope.c
+  now use gs_texture_create_from_file (exists in 30-33, same STRAIGHT alpha). CI: macOS on
+  macos-15; onsdriver tests each build on its own OBS major, except the Windows OBS 32 build,
+  which is tested on the newest OBS. Third-party plugin location changes in 33 (legacy
+  locations load until 34).
 - Known gaps: PQ canvas uses legacy SDR path; focus peaking bypass texture carries the HLG
   signal in HLG mode (untested); false colour/zebra filters are SDR-only; ROI display untested.
 

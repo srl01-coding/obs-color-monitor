@@ -2,7 +2,6 @@
 #include <util/platform.h>
 #include <util/dstr.h>
 #include <graphics/matrix4.h>
-#include <graphics/image-file.h>
 #include "plugin-macros.generated.h"
 #include "obs-convenience.h"
 #include "common.h"
