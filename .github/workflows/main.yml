@@ -89,7 +89,7 @@ jobs:
             screenshots/*
 
   macos_build:
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
@@ -234,6 +234,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           obs-plugins: package/*.zip
+          # Test against the OBS major the plugin was built for: since onsdriver began
+          # installing the latest release (OBS 33.0.1, Nov 2026), OBS never reached
+          # "Switched to scene" within its 25 s startup check on Windows.
+          obs-version: '==${{ matrix.obs }}.*'
           first-time-log: ./logs/
 
       - name: 'Test with onsdriver'
@@ -296,6 +300,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           obs-plugins: package/*.zip
+          # Test against the OBS major the plugin was built for: since onsdriver began
+          # installing the latest release (OBS 33.0.1, Nov 2026), OBS never reached
+          # "Switched to scene" within its 25 s startup check on Windows.
+          obs-version: '==${{ matrix.obs }}.*'
           first-time-log: ./logs/
 
       - name: 'Test with onsdriver'
